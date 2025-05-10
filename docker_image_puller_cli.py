@@ -66,7 +66,16 @@ def main():
             args.image = input("请输入 Docker 镜像名称（例如：library/ubuntu:latest 或者 alpine）：").strip()
             if not args.image:
                 logger.error("错误：镜像名称是必填项。")
-                return
+                while True:
+                    user_input = input("输入 1 继续，输入 0 退出：").strip()
+                    if user_input == '1':
+                        main()  # 递归调用 main 函数继续执行
+                        break
+                    elif user_input == '0':
+                        logger.info("退出程序。")
+                        sys.exit(0)
+                    else:
+                        logger.info("输入无效，请输入 1 或 0。")
 
         # 获取仓库地址
         if not args.registry:
