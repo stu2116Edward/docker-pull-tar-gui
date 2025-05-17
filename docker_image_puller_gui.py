@@ -423,7 +423,21 @@ class DockerPullerGUI(QMainWindow):
         self.worker.layer_progress_signal.connect(self.layer_progress_bar.setValue)
         self.worker.overall_progress_signal.connect(self.overall_progress_bar.setValue)
 
-        threading.Thread(target=self.worker.run).start()
+        # 拉取完成后恢复按钮
+        def on_pull_finished(*args, **kwargs):
+            self.is_pulling = False
+            self.pull_button.setEnabled(True)
+        # 连接线程结束信号
+        thread = threading.Thread(target=self.worker.run)
+        thread.start()
+        # 轮询线程状态，拉取完成后恢复按钮
+        def check_thread():
+            if thread.is_alive():
+                QTimer.singleShot(200, check_thread)
+            else:
+                on_pull_finished()
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(200, check_thread)
 
     def reset_fields(self):
         """重置表单"""
@@ -552,21 +566,66 @@ class DockerPullerGUI(QMainWindow):
             palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
             palette.setColor(QPalette.ColorRole.PlaceholderText, Qt.GlobalColor.lightGray)
 
-            # 设置控件样式
-            self.search_result_text.setStyleSheet("""
-                QTextEdit {
+            # 强制控件样式
+            dark_style = """
+                QTextEdit, QLineEdit {
+                    background-color: #252525;
+                    color: white;
+                    border: 1px solid #444;
+                    selection-background-color: #444;
+                    selection-color: white;
+                }
+                QComboBox {
                     background-color: #252525;
                     color: white;
                     border: 1px solid #444;
                 }
-            """)
-            self.pull_log_text.setStyleSheet("""
-                QTextEdit {
+                QComboBox QAbstractItemView {
                     background-color: #252525;
                     color: white;
-                    border: 1px solid #444;
+                    selection-background-color: #444;
+                    selection-color: white;
                 }
-            """)
+                QGroupBox {
+                    border: 1px solid #444;
+                    margin-top: 6px;
+                    color: white;
+                }
+                QGroupBox:title {
+                    subcontrol-origin: margin;
+                    subcontrol-position: top left;
+                    padding: 0 3px;
+                }
+                QTabWidget::pane {
+                    border: 1px solid #444;
+                    background: #353535;
+                }
+                QTabBar::tab {
+                    background: #353535;
+                    color: white;
+                    border: 1px solid #444;
+                    padding: 6px 12px;
+                    border-bottom: none;
+                }
+                QTabBar::tab:selected {
+                    background: #252525;
+                    color: #FFD700;
+                    border-bottom: 2px solid #FFD700;
+                }
+                QProgressBar {
+                    border: 1px solid #444;
+                    border-radius: 4px;
+                    background: #252525;
+                    text-align: center;
+                    color: white;
+                }
+                QProgressBar::chunk {
+                    background-color: #45a049;
+                }
+            """
+            self.setStyleSheet(dark_style)
+            self.search_result_text.setStyleSheet("QTextEdit { background-color: #252525; color: white; border: 1px solid #444; }")
+            self.pull_log_text.setStyleSheet("QTextEdit { background-color: #252525; color: white; border: 1px solid #444; }")
             self.settings_button.setStyleSheet("""
                 QPushButton {
                     background-color: #535353;
@@ -577,6 +636,8 @@ class DockerPullerGUI(QMainWindow):
                     background-color: #636363;
                 }
             """)
+            # 强制设置所有相关label为白色
+            label_color = "color: white;"
         else:
             # 亮色模式设置
             palette.setColor(QPalette.ColorRole.Window, QColor(240, 240, 240))
@@ -586,21 +647,54 @@ class DockerPullerGUI(QMainWindow):
             palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.black)
             palette.setColor(QPalette.ColorRole.PlaceholderText, Qt.GlobalColor.gray)
 
-            # 设置控件样式
-            self.search_result_text.setStyleSheet("""
-                QTextEdit {
+            light_style = """
+                QTextEdit, QLineEdit, QComboBox {
                     background-color: white;
                     color: black;
                     border: 1px solid #ccc;
+                    selection-background-color: #cceeff;
+                    selection-color: black;
                 }
-            """)
-            self.pull_log_text.setStyleSheet("""
-                QTextEdit {
-                    background-color: white;
+                QGroupBox {
+                    border: 1px solid #ccc;
+                    margin-top: 6px;
+                    color: black;
+                }
+                QGroupBox:title {
+                    subcontrol-origin: margin;
+                    subcontrol-position: top left;
+                    padding: 0 3px;
+                }
+                QTabWidget::pane {
+                    border: 1px solid #ccc;
+                    background: #f0f0f0;
+                }
+                QTabBar::tab {
+                    background: #f0f0f0;
                     color: black;
                     border: 1px solid #ccc;
+                    padding: 6px 12px;
+                    border-bottom: none;
                 }
-            """)
+                QTabBar::tab:selected {
+                    background: white;
+                    color: #0078d7;
+                    border-bottom: 2px solid #0078d7;
+                }
+                QProgressBar {
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
+                    background: white;
+                    text-align: center;
+                    color: black;
+                }
+                QProgressBar::chunk {
+                    background-color: #4CAF50;
+                }
+            """
+            self.setStyleSheet(light_style)
+            self.search_result_text.setStyleSheet("QTextEdit { background-color: white; color: black; border: 1px solid #ccc; }")
+            self.pull_log_text.setStyleSheet("QTextEdit { background-color: white; color: black; border: 1px solid #ccc; }")
             self.settings_button.setStyleSheet("""
                 QPushButton {
                     background-color: #f0f0f0;
@@ -611,30 +705,23 @@ class DockerPullerGUI(QMainWindow):
                     background-color: #e0e0e0;
                 }
             """)
+            # 强制设置所有相关label为黑色
+            label_color = "color: black;"
+
+        # 强制设置所有相关label颜色
+        for label in [
+            self.registry_label,
+            self.image_label,
+            self.tag_label,
+            self.arch_label,
+            self.layer_progress_label,
+            self.overall_progress_label
+        ]:
+            label.setStyleSheet(label_color)
 
         # 应用调色板到应用程序和窗口
         self.setPalette(palette)
         QApplication.instance().setPalette(palette)
-
-        # 确保输入框的文本颜色正确
-        input_style = """
-            QLineEdit, QComboBox {
-                background-color: white;
-                color: black;
-                border: 1px solid #ccc;
-            }
-        """ if self.theme_mode == "light" else """
-            QLineEdit, QComboBox {
-                background-color: #333;
-                color: white;
-                border: 1px solid #444;
-            }
-        """
-        self.search_entry.setStyleSheet(input_style)
-        self.image_entry.setStyleSheet(input_style)
-        self.tag_entry.setStyleSheet(input_style)
-        self.registry_combobox.setStyleSheet(input_style)
-        self.arch_combobox.setStyleSheet(input_style)
 
     def update_ui_text(self):
         """更新UI文本"""
