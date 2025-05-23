@@ -515,6 +515,28 @@ class DockerPullerGUI(QMainWindow):
         ok_button.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
         self.apply_button_style(ok_button)
 
+        # 修复暗色模式下弹窗为亮色的问题
+        if self.theme_mode == "dark":
+            msg_box.setStyleSheet("""
+                QMessageBox {
+                    background-color: #353535;
+                    color: white;
+                }
+                QLabel {
+                    color: white;
+                }
+                QPushButton {
+                    background-color: #535353;
+                    color: white;
+                    border: 1px solid #333;
+                }
+                QPushButton:hover {
+                    background-color: #636363;
+                }
+            """)
+        else:
+            msg_box.setStyleSheet("")
+
         msg_box.exec()
 
     def apply_button_style(self, button):
@@ -648,10 +670,21 @@ class DockerPullerGUI(QMainWindow):
             palette.setColor(QPalette.ColorRole.PlaceholderText, Qt.GlobalColor.gray)
 
             light_style = """
-                QTextEdit, QLineEdit, QComboBox {
+                QTextEdit, QLineEdit {
                     background-color: white;
                     color: black;
                     border: 1px solid #ccc;
+                    selection-background-color: #cceeff;
+                    selection-color: black;
+                }
+                QComboBox {
+                    background-color: white;
+                    color: black;
+                    border: 1px solid #ccc;
+                }
+                QComboBox QAbstractItemView {
+                    background-color: white;
+                    color: black;
                     selection-background-color: #cceeff;
                     selection-color: black;
                 }
