@@ -4,10 +4,10 @@
 
 ### 演示
 **搜索镜像**：  
-![dp_demo3](https://github.com/user-attachments/assets/3919525a-a4e2-45bb-80c9-87324c949d6d)  
+![dp_demo3](https://github.com/user-attachments/assets/9cd39f54-55a6-4cd2-8ba1-8929d760ef4e)  
 
 **下载镜像包**：  
-![dp_demo4](https://github.com/user-attachments/assets/d92150a6-51d3-4935-bab2-6465c6ba8c85)  
+![dp_demo4](https://github.com/user-attachments/assets/4b1fde7a-3f0d-4d3e-a7ac-92dedeec7e39)  
 
 这个项目的目的在于方便那些喜欢图形界面的用户使用  
 
