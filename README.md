@@ -7,10 +7,10 @@ Currently only supports Chinese and English.
 
 ### Demo  
 **Search mirror**：  
-![dp_demo1](https://github.com/user-attachments/assets/d237dd36-1d1f-49c2-a573-d56b16d5e67f)  
+![dp_demo1](https://github.com/user-attachments/assets/6d907bb9-bbee-4197-a3b5-dfd9358abf9d)  
 
 **Download the image package**：  
-![dp_demo2](https://github.com/user-attachments/assets/5ca5d959-f0dd-4005-a3a2-306e1b9e4f70)  
+![dp_demo2](https://github.com/user-attachments/assets/fc998a5d-7671-449c-a2d1-5ad6249eca62)  
 
 The purpose of this project is to facilitate the use for users who prefer graphical interfaces.
 
