@@ -17,7 +17,7 @@ class DockerImageSearcher:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Accept": "application/json",
         }
-        self.timeout = 1.5  # 请求超时时间
+        self.timeout = 1  # 请求超时时间
     
     def _load_registries(self) -> List[str]:
         """加载注册表地址列表，优先使用官方地址"""
