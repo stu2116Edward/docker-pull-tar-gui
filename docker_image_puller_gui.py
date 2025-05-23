@@ -18,8 +18,10 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QTabWidget,
-    QListWidget,
-    QInputDialog
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QMenu
 )
 from PyQt6.QtGui import QIcon, QFont, QColor, QPalette
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize
@@ -77,23 +79,24 @@ class Worker(QObject):
     def overall_progress_callback(self, value):
         self.overall_progress_signal.emit(value)
 
+# 定义默认输出条数
+DEFAULT_RESULT_LIMIT = 25
 
 class SearchWorker(QObject):
-    """用于搜索镜像的后台线程"""
     log_signal = pyqtSignal(str)
     search_result_signal = pyqtSignal(list)
 
-    def __init__(self, search_term):
+    def __init__(self, search_term, limit=DEFAULT_RESULT_LIMIT):
         super().__init__()
         self.search_term = search_term
+        self.limit = limit
         self.searcher = DockerImageSearcher()
 
     def run(self):
         try:
             self.log_signal.emit(f"正在搜索镜像: {self.search_term}...\n")
             QApplication.processEvents()
-
-            results = self.searcher.search_images(self.search_term, limit=25)
+            results = self.searcher.search_images(self.search_term, limit=self.limit)
             if results:
                 self.log_signal.emit(f"从 {self.searcher.current_registry} 找到 {len(results)} 个结果:\n")
                 self.search_result_signal.emit(results)
@@ -111,6 +114,7 @@ class DockerPullerGUI(QMainWindow):
         self.is_pulling = False
         self.is_searching = False
         self.searcher = DockerImageSearcher()
+        self.result_limit = DEFAULT_RESULT_LIMIT
 
         # 定义图标路径
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -180,16 +184,92 @@ class DockerPullerGUI(QMainWindow):
         search_group.setLayout(search_box_layout)
         search_layout.addWidget(search_group)
 
-        # 搜索结果
-        self.search_result_text = QTextEdit()
-        self.search_result_text.setReadOnly(True)
-        self.search_result_text.setFont(QFont("Consolas", 10))
-        search_layout.addWidget(self.search_result_text)
+        # 来源信息标签
+        self.search_source_label = QLabel("")
+        self.search_source_label.setFont(QFont("Microsoft YaHei", 10))
+        self.search_source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        search_layout.addWidget(self.search_source_label)
+
+        # 搜索结果表格
+        self.search_result_table = QTableWidget()
+        self.search_result_table.setColumnCount(4)
+        self.search_result_table.setHorizontalHeaderLabels(["NAME", "DESCRIPTION", "STARS", "OFFICIAL"])
+        self.search_result_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.search_result_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.search_result_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.search_result_table.horizontalHeader().setStretchLastSection(True)
+        self.search_result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.search_result_table.verticalHeader().setVisible(False)
+        self.search_result_table.setFont(QFont("Consolas", 10))
+        self.search_result_table.doubleClicked.connect(self.fill_pull_fields_from_search)
+        search_layout.addWidget(self.search_result_table)
 
         self.tabs.addTab(search_tab, {
             "zh": "镜像搜索",
             "en": "Image Search"
         }[self.language])
+
+        # 初始化表头颜色
+        self.update_search_table_header_style()
+        
+        # 添加右键复制输出信息
+        self.search_result_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.search_result_table.customContextMenuRequested.connect(self.show_table_context_menu)
+        
+    def update_search_table_header_style(self):
+        """根据主题设置表头颜色"""
+        header = self.search_result_table.horizontalHeader()
+        if self.theme_mode == "dark":
+            header.setStyleSheet("""
+                QHeaderView::section {
+                    background-color: #353535;
+                    color: #FFD700;
+                    border: 1px solid #444;
+                    font-weight: bold;
+                }
+            """)
+        else:
+            header.setStyleSheet("""
+                QHeaderView::section {
+                    background-color: #f0f0f0;
+                    color: #0078d7;
+                    border: 1px solid #ccc;
+                    font-weight: bold;
+                }
+            """)
+            
+    def show_table_context_menu(self, pos):
+        index = self.search_result_table.indexAt(pos)
+        if not index.isValid():
+            return
+        menu = QMenu(self)
+        copy_action = menu.addAction({
+            "zh": "复制本行",
+            "en": "Copy This Row"
+        }[self.language])
+        # 主题自适应
+        if self.theme_mode == "dark":
+            menu.setStyleSheet("""
+                QMenu { background-color: #353535; color: white; }
+                QMenu::item:selected { background-color: #636363; }
+            """)
+        else:
+            menu.setStyleSheet("""
+                QMenu { background-color: #fff; color: black; }
+                QMenu::item:selected { background-color: #cceeff; }
+            """)
+        copy_action.triggered.connect(lambda: self.copy_table_row(index.row()))
+        menu.exec(self.search_result_table.viewport().mapToGlobal(pos))
+
+    def copy_table_row(self, row):
+        """复制指定行的所有内容（包括被省略的）"""
+        col_count = self.search_result_table.columnCount()
+        row_data = []
+        for col in range(col_count):
+            item = self.search_result_table.item(row, col)
+            row_data.append(item.text() if item else "")
+        clipboard = QApplication.clipboard()
+        clipboard.setText('\t'.join(row_data))
 
     def create_pull_tab(self):
         """创建拉取标签页"""
@@ -351,9 +431,9 @@ class DockerPullerGUI(QMainWindow):
         self.is_searching = True
         self.search_button.setEnabled(False)
 
-        self.search_result_text.clear()
-        self.worker = SearchWorker(search_term)
-        self.worker.log_signal.connect(self.search_result_text.append)
+        self.search_result_table.setRowCount(0)
+        self.worker = SearchWorker(search_term, self.result_limit)
+        # 如需显示日志，可用QMessageBox或状态栏等，这里暂不处理log_signal
         self.worker.search_result_signal.connect(self.display_search_results)
         threading.Thread(target=self.worker.run).start()
 
@@ -362,37 +442,69 @@ class DockerPullerGUI(QMainWindow):
         self.is_searching = False
         self.search_button.setEnabled(True)
 
+        self.search_result_table.setRowCount(0)
+        # 获取来源
+        source = getattr(self.worker.searcher, "current_registry", "未知来源")
+        if "://" in source:
+            source = source.split("://", 1)[1]
         if results:
-            # 格式化表头
-            header = f"{'NAME'.ljust(30)}{'DESCRIPTION'.ljust(60)}{'STARS'.ljust(10)}{'OFFICIAL'}"
-            self.search_result_text.append(header)
-            self.search_result_text.append("-" * len(header))
-
-            # 添加结果
-            for img in results:
-                self.search_result_text.append(
-                    f"{img['name'].ljust(30)}"
-                    f"{img['description'].ljust(60)}"
-                    f"{str(img['stars']).ljust(10)}"
-                    f"{img['official']}"
-                )
-
-            # 双击结果自动填充到拉取标签页
-            self.search_result_text.mouseDoubleClickEvent = lambda event: self.fill_pull_fields_from_search()
+            msg = {
+                "zh": f"从 {source} 找到 {len(results)} 个结果:",
+                "en": f"Found {len(results)} results from {source}:"
+            }[self.language]
+            self.search_source_label.setText(msg)
+            self.search_result_table.setRowCount(len(results))
+            for row, img in enumerate(results):
+                self.search_result_table.setItem(row, 0, QTableWidgetItem(img['name']))
+                self.search_result_table.setItem(row, 1, QTableWidgetItem(img['description']))
+                self.search_result_table.setItem(row, 2, QTableWidgetItem(str(img['stars'])))
+                self.search_result_table.setItem(row, 3, QTableWidgetItem(str(img['official'])))
         else:
-            self.search_result_text.append({
-                "zh": "没有找到匹配的镜像\n",
-                "en": "No matching images found\n"
-            }[self.language])
+            msg = {
+                "zh": "没有找到匹配的镜像",
+                "en": "No matching images found"
+            }[self.language]
+            self.search_source_label.setText(msg)
+            self.search_result_table.setRowCount(1)
+            self.search_result_table.setItem(0, 0, QTableWidgetItem(msg))
+            self.search_result_table.setItem(0, 1, QTableWidgetItem(""))
+            self.search_result_table.setItem(0, 2, QTableWidgetItem(""))
+            self.search_result_table.setItem(0, 3, QTableWidgetItem(""))
+
+        # 每次都刷新表头颜色
+        self.update_search_table_header_style()
+
+        # 设置表头颜色适配主题
+        header = self.search_result_table.horizontalHeader()
+        if self.theme_mode == "dark":
+            # 暗色模式表头
+            header.setStyleSheet("""
+                QHeaderView::section {
+                    background-color: #353535;
+                    color: #FFD700;
+                    border: 1px solid #444;
+                    font-weight: bold;
+                }
+            """)
+        else:
+            # 亮色模式表头
+            header.setStyleSheet("""
+                QHeaderView::section {
+                    background-color: #f0f0f0;
+                    color: #0078d7;
+                    border: 1px solid #ccc;
+                    font-weight: bold;
+                }
+            """)
 
     def fill_pull_fields_from_search(self):
         """将搜索结果填充到拉取表单"""
-        cursor = self.search_result_text.textCursor()
-        line_text = cursor.block().text()
-        if line_text and "NAME" not in line_text:  # 忽略表头
-            image_name = line_text[:30].strip()
-            self.image_entry.setText(image_name)
-            self.tabs.setCurrentIndex(1)  # 切换到拉取标签页
+        selected = self.search_result_table.currentRow()
+        if selected >= 0:
+            image_name = self.search_result_table.item(selected, 0).text()
+            if image_name and image_name != "NAME":
+                self.image_entry.setText(image_name)
+                self.tabs.setCurrentIndex(1)  # 切换到拉取标签页
 
     def pull_image(self):
         """拉取镜像"""
@@ -588,7 +700,6 @@ class DockerPullerGUI(QMainWindow):
             palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
             palette.setColor(QPalette.ColorRole.PlaceholderText, Qt.GlobalColor.lightGray)
 
-            # 强制控件样式
             dark_style = """
                 QTextEdit, QLineEdit {
                     background-color: #252525;
@@ -644,9 +755,16 @@ class DockerPullerGUI(QMainWindow):
                 QProgressBar::chunk {
                     background-color: #45a049;
                 }
+                QTableWidget {
+                    background-color: white;
+                    color: black;
+                    border: 1px solid #ccc;
+                    selection-background-color: #e0e0e0;
+                    selection-color: black;
+                }
             """
             self.setStyleSheet(dark_style)
-            self.search_result_text.setStyleSheet("QTextEdit { background-color: #252525; color: white; border: 1px solid #444; }")
+            self.search_result_table.setStyleSheet("QTableWidget { background-color: #252525; color: white; border: 1px solid #444; }")
             self.pull_log_text.setStyleSheet("QTextEdit { background-color: #252525; color: white; border: 1px solid #444; }")
             self.settings_button.setStyleSheet("""
                 QPushButton {
@@ -658,7 +776,6 @@ class DockerPullerGUI(QMainWindow):
                     background-color: #636363;
                 }
             """)
-            # 强制设置所有相关label为白色
             label_color = "color: white;"
         else:
             # 亮色模式设置
@@ -724,9 +841,25 @@ class DockerPullerGUI(QMainWindow):
                 QProgressBar::chunk {
                     background-color: #4CAF50;
                 }
+                QTableWidget {
+                    background-color: white;
+                    color: black;
+                    border: 1px solid #ccc;
+                }
+                QTableWidget::item:selected {
+                    background-color: #e0e0e0;
+                    color: black;
+                }
+                QTableWidget::item:focus {
+                    outline: none;
+                }
+                QTableWidget::item:selected:!active {
+                    background-color: #e0e0e0;
+                    color: black;
+                }
             """
             self.setStyleSheet(light_style)
-            self.search_result_text.setStyleSheet("QTextEdit { background-color: white; color: black; border: 1px solid #ccc; }")
+            self.search_result_table.setStyleSheet("QTableWidget { background-color: white; color: black; border: 1px solid #ccc; }")
             self.pull_log_text.setStyleSheet("QTextEdit { background-color: white; color: black; border: 1px solid #ccc; }")
             self.settings_button.setStyleSheet("""
                 QPushButton {
@@ -738,7 +871,6 @@ class DockerPullerGUI(QMainWindow):
                     background-color: #e0e0e0;
                 }
             """)
-            # 强制设置所有相关label为黑色
             label_color = "color: black;"
 
         # 强制设置所有相关label颜色
@@ -748,13 +880,19 @@ class DockerPullerGUI(QMainWindow):
             self.tag_label,
             self.arch_label,
             self.layer_progress_label,
-            self.overall_progress_label
+            self.overall_progress_label,
+            getattr(self, "search_source_label", None)
         ]:
-            label.setStyleSheet(label_color)
+            if label:
+                label.setStyleSheet(label_color)
 
         # 应用调色板到应用程序和窗口
         self.setPalette(palette)
         QApplication.instance().setPalette(palette)
+
+        # 每次切换主题都刷新表头颜色
+        if hasattr(self, "update_search_table_header_style"):
+            self.update_search_table_header_style()
 
     def update_ui_text(self):
         """更新UI文本"""
@@ -851,6 +989,17 @@ class DockerPullerGUI(QMainWindow):
             ("dark", "en"): "Dark"
         }[(self.theme_mode, self.language)])
 
+        # 输出条数设置
+        limit_label = QLabel({
+            "zh": "输出条数：",
+            "en": "Result Limit:"
+        }[self.language])
+        from PyQt6.QtWidgets import QSpinBox
+        limit_spin = QSpinBox()
+        limit_spin.setRange(1, 100)
+        limit_spin.setValue(getattr(self, "result_limit", DEFAULT_RESULT_LIMIT))
+        limit_spin.setSingleStep(1)
+
         # 应用按钮
         apply_btn = QPushButton({
             "zh": "应用",
@@ -859,17 +1008,22 @@ class DockerPullerGUI(QMainWindow):
         apply_btn.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
         self.apply_button_style(apply_btn)
 
+        # 自适应布局
         layout = QVBoxLayout()
         layout.addWidget(lang_label)
         layout.addWidget(lang_combo)
         layout.addWidget(theme_label)
         layout.addWidget(theme_combo)
+        layout.addWidget(limit_label)
+        layout.addWidget(limit_spin)
         layout.addWidget(apply_btn)
+        layout.addStretch()
         dialog.setLayout(layout)
 
         def apply_settings():
             self.language = "zh" if lang_combo.currentText() == "中文" else "en"
             self.theme_mode = "light" if theme_combo.currentText() in ["亮色", "Light"] else "dark"
+            self.result_limit = limit_spin.value()
             self.update_ui_text()
             self.apply_theme_mode()
             dialog.close()
