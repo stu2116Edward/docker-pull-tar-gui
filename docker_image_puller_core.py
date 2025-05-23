@@ -16,7 +16,7 @@ from threading import Event
 urllib3.disable_warnings()
 
 # 版本号
-VERSION = "v1.0.9"
+VERSION = "v1.1.0"
 
 # 配置日志
 logging.basicConfig(
