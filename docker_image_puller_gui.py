@@ -27,7 +27,7 @@ from PyQt6.QtGui import QIcon, QFont, QColor, QPalette
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize
 
 # 导入核心功能
-from docker_image_puller_core import pull_image_logic, stop_event, VERSION
+from docker_image_puller import pull_image_logic, stop_event, VERSION
 from docker_images_search import DockerImageSearcher
 
 class Worker(QObject):
