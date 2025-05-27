@@ -17,31 +17,31 @@ class DockerImageSearcher:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Accept": "application/json",
         }
-        self.timeout = 1  # 请求超时时间
+        self.timeout = 1.5  # 请求超时时间
     
     def _load_registries(self) -> List[str]:
         """加载注册表地址列表，优先使用官方地址"""
         registries = [
             "https://registry.hub.docker.com",
         ]
-        
         try:
-            if os.path.exists("registries.txt"):
-                with open("registries.txt", "r") as f:
+            base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            reg_path = os.path.join(base_dir, "registries.txt")
+            if os.path.exists(reg_path):
+                with open(reg_path, "r") as f:
                     custom_registries = [line.strip() for line in f if line.strip()]
                     registries[1:1] = custom_registries
         except Exception as e:
             print(f"警告: 加载registries.txt失败 - {str(e)}")
-        
         return registries
     
     # 接口请求示例：https://registry.hub.docker.com/v2/search/repositories/?query=nginx
-    def search_images(self, term: str, limit: int = 25) -> Optional[List[Dict]]:
+    def search_images(self, search_term: str, limit: int = 25) -> Optional[List[Dict]]:
         """
         搜索Docker镜像
         """
         params = {
-            "query": term,
+            "query": search_term,
             "page_size": limit,
         }
         
@@ -100,26 +100,32 @@ class DockerImageSearcher:
         return None
 
 
-def print_search_results(results: List[Dict], registry: str):
+def print_search_results(results: List[Dict], registry: str, limit: int = 25):
     """打印搜索结果，格式类似docker search命令"""
     print(f"\n使用的注册表地址: {registry}\n")
     
     if not results:
         print("没有找到匹配的镜像")
         return
-    
+
+    # 限制描述最大长度，避免表格错位
+    max_desc_len = 60
     name_width = max(len(img["name"]) for img in results) + 2
-    desc_width = max(len(img["description"]) for img in results) + 2
-    stars_width = 5
+    desc_width = min(max(len(img["description"]) for img in results) + 2, max_desc_len + 2)
+    stars_width = 7   # 增加宽度，便于后面加空格
     official_width = 8
-    
+
     header = f"{'NAME'.ljust(name_width)}{'DESCRIPTION'.ljust(desc_width)}{'STARS'.ljust(stars_width)}{'OFFICIAL'.ljust(official_width)}"
     print(header)
     print("-" * len(header))
-    
-    for img in results:
+
+    # 只输出指定数量的结果
+    for img in results[:limit]:
         name = img["name"].ljust(name_width)
-        desc = img["description"].ljust(desc_width)
+        desc = img["description"]
+        if len(desc) > max_desc_len:
+            desc = desc[:max_desc_len - 3] + "..."
+        desc = desc.ljust(desc_width)
         stars = str(img["stars"]).ljust(stars_width)
         official = img["official"].ljust(official_width)
         print(f"{name}{desc}{stars}{official}")
@@ -128,7 +134,8 @@ def print_search_results(results: List[Dict], registry: str):
 def main():
     parser = argparse.ArgumentParser(
         description="Docker镜像搜索工具（无需本地Docker环境）",
-        add_help=False  # 禁用自动help，我们自己处理
+        usage="python docker_images_search.py [search_term] [--limit number] [-h]",
+        add_help=False
     )
     parser.add_argument("search_term", nargs="?", help="要搜索的镜像名称或关键字")
     parser.add_argument("--limit", type=int, default=25, help="返回结果数量限制")
@@ -147,7 +154,7 @@ def main():
         searcher = DockerImageSearcher()
         search_results = searcher.search_images(args.search_term, args.limit)
         if search_results is not None:
-            print_search_results(search_results, searcher.current_registry)
+            print_search_results(search_results, searcher.current_registry, args.limit)
             
     except KeyboardInterrupt:
         print("\n程序被用户中断")
