@@ -66,7 +66,7 @@ class DockerImageSearcher:
                     data = response.json()
                     
                     if not data.get("results"):
-                        print(f"从 {registry} 获取到空结果，尝试下一个注册表...")
+                        print(f"从 {registry} 获取到空结果，尝试下一个注册表...", flush=True)
                         continue
                     
                     results = []
@@ -80,23 +80,23 @@ class DockerImageSearcher:
                         })
                     return results
                 else:
-                    print(f"从 {registry} 获取数据失败，状态码: {response.status_code}")
+                    print(f"从 {registry} 获取数据失败，状态码: {response.status_code}", flush=True)
                     continue
                 
             except requests.exceptions.Timeout:
-                print(f"连接 {registry} 超时，尝试下一个注册表...")
+                print(f"连接 {registry} 超时，尝试下一个注册表...", flush=True)
                 continue
             except requests.exceptions.RequestException as e:
-                print(f"连接 {registry} 出错: {str(e)}")
+                print(f"连接 {registry} 出错: {str(e)}", flush=True)
                 continue
             except KeyboardInterrupt:
                 print("\n用户中断操作，停止搜索")
                 return None
             except Exception as e:
-                print(f"处理 {registry} 数据时出错: {str(e)}")
+                print(f"处理 {registry} 数据时出错: {str(e)}", flush=True)
                 continue
         
-        print("所有注册表尝试失败，请检查网络连接或稍后再试")
+        print("所有注册表尝试失败，请检查网络连接或稍后再试", flush=True)
         return None
 
 
