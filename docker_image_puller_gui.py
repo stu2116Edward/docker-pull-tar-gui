@@ -432,8 +432,13 @@ class DockerPullerGUI(QMainWindow):
         self.search_button.setEnabled(False)
 
         self.search_result_table.setRowCount(0)
+        
+        self.search_source_label.setText({
+            "zh": "正在搜索，请稍候...",
+            "en": "Searching, please wait..."
+        }[self.language])
+
         self.worker = SearchWorker(search_term, self.result_limit)
-        # 如需显示日志，可用QMessageBox或状态栏等，这里暂不处理log_signal
         self.worker.search_result_signal.connect(self.display_search_results)
         threading.Thread(target=self.worker.run).start()
 
@@ -1032,6 +1037,7 @@ class DockerPullerGUI(QMainWindow):
         dialog.exec()
 
 if __name__ == "__main__":
+    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
     app = QApplication(sys.argv)
     window = DockerPullerGUI()
     window.show()
