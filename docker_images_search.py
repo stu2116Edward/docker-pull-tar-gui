@@ -54,7 +54,7 @@ class DockerImageSearcher:
             self.current_registry = registry
             
             try:
-                print(f"尝试从 {registry} 搜索...")
+                print(f"尝试从 {registry} 搜索...", flush=True)
                 response = requests.get(
                     api_url,
                     headers=self.headers,
