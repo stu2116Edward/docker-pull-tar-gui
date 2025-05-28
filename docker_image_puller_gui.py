@@ -557,12 +557,13 @@ class DockerPullerGUI(QMainWindow):
         QTimer.singleShot(200, check_thread)
 
     def reset_fields(self):
-        """重置表单"""
+        """重置表单和搜索状态"""
         if self.is_pulling:
             stop_event.set()
             self.is_pulling = False
             self.pull_button.setEnabled(True)
 
+        # 拉取区重置
         self.pull_log_text.clear()
         self.image_entry.clear()
         self.tag_entry.setText("latest")
@@ -570,6 +571,14 @@ class DockerPullerGUI(QMainWindow):
         self.arch_combobox.setCurrentIndex(0)
         self.layer_progress_bar.setValue(0)
         self.overall_progress_bar.setValue(0)
+
+        # 搜索区重置
+        self.search_entry.clear()
+        self.search_result_table.setRowCount(0)
+        self.search_source_label.setText("")
+        self.is_searching = False
+        self.search_button.setEnabled(True)
+        self.load_registries()  # 重新加载仓库地址
 
     def load_registries(self):
         """加载仓库列表"""
