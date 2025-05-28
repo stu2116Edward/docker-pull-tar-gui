@@ -1,5 +1,6 @@
 import sys
 import os
+import io
 import gzip
 import json
 import hashlib
@@ -13,6 +14,10 @@ from urllib3.util.retry import Retry
 import urllib3
 from threading import Event
 
+
+# Set default encoding to UTF-8
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # 禁用 SSL 警告
 urllib3.disable_warnings()
