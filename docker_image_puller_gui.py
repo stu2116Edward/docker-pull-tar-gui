@@ -1037,7 +1037,6 @@ class DockerPullerGUI(QMainWindow):
         dialog.exec()
 
 if __name__ == "__main__":
-    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
     app = QApplication(sys.argv)
     window = DockerPullerGUI()
     window.show()
