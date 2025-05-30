@@ -17,10 +17,11 @@ The purpose of this project is to facilitate the use for users who prefer graphi
 
 
 ### How to use it in Linux
-Get the script
+Get the script：
 ```bash
 wget https://raw.githubusercontent.com/stu2116Edward/docker-pull-tar-gui/refs/heads/main/docker_image_puller.py
 ```
+Usage：
 ```bash
 python3 docker_image_puller.py [-i IMAGE] [-a ARCH] [-r REGISTRY]
 ```
