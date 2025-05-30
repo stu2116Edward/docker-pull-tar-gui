@@ -34,7 +34,7 @@ python3 docker_image_puller.py [Options]
 ```
 - `-h, --help`：Displays help information
 - `-v, --version`：Displays version information
-- `-i, --image`：Specify the name of the Docker image（example：library/ubuntu:latest）
+- `-i, --image`：Specify the name of the Docker image（example：library/ubuntu:latest or alpine）
 - `-a, --arch`：Specify the Architecture（默认：amd64）
 - `-r, --registry`：Specify the Docker repository address（default：abc.itelyou.cf）
 - `--debug`：Enable debug mode and print detailed logs
