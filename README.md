@@ -40,7 +40,7 @@ python3 docker_image_puller.py [Options]
 - `-r, --registry`：Specify the Docker repository address（default：abc.itelyou.cf）
 - `--debug`：Enable debug mode and print detailed logs
 
-**example**:
+**example**:  
 Displays help information
 ```bash
 python3 docker_image_puller.py -h
