@@ -65,3 +65,18 @@ docker load -i library_nginx_amd64.tar
 ```bash
 docker images
 ```
+
+
+### 项目打包
+安装 Pyinstaller：
+```
+pip install pyinstaller
+```
+**GUI**:
+```
+pyinstaller -F -w -i favicon.ico docker_image_puller_gui.py --add-data "logo.ico;." --add-data "settings.png;."
+```
+**CLI**:
+```
+pyinstaller -F -i favicon.ico docker_image_puller.py
+```
