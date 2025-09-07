@@ -8,7 +8,7 @@
 ![dp_demo3](https://github.com/user-attachments/assets/9cd39f54-55a6-4cd2-8ba1-8929d760ef4e)  
 
 **下载镜像包**：  
-![dp_demo4](https://github.com/user-attachments/assets/4b1fde7a-3f0d-4d3e-a7ac-92dedeec7e39)  
+<img width="1193" height="941" alt="dp_demo4" src="https://github.com/user-attachments/assets/abddc7af-392f-4749-bd45-6f546eb211b1" />
 
 这个项目的目的在于方便那些喜欢图形界面的用户使用  
 
@@ -80,3 +80,4 @@ pyinstaller -F -w -i favicon.ico docker_image_puller_gui.py --add-data "logo.ico
 ```
 pyinstaller -F -i favicon.ico docker_image_puller.py
 ```
+
