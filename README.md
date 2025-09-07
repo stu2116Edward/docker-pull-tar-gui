@@ -1,6 +1,6 @@
 # docker-pull-tar-gui
 
-[中文](https://github.com/stu2116Edward/docker-pull-tar-gui/blob/main/README.zh-CN.md#%E5%A6%82%E4%BD%95%E4%BD%BF%E7%94%A8%E9%95%9C%E5%83%8F%E5%8C%85)  
+**Language**: [中文](https://github.com/stu2116Edward/docker-pull-tar-gui/blob/main/README.zh-CN.md#%E5%A6%82%E4%BD%95%E4%BD%BF%E7%94%A8%E9%95%9C%E5%83%8F%E5%8C%85)  
 
 This tool is used for packaging Docker images and can be used out of the box without needing to install any local environment.  
 Currently only supports Chinese and English.
