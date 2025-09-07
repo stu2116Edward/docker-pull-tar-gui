@@ -8,10 +8,10 @@ Currently only supports Chinese and English.
 
 ### Demo  
 **Search mirror**：  
-![dp_demo1](https://github.com/user-attachments/assets/6d907bb9-bbee-4197-a3b5-dfd9358abf9d)  
+<img width="1202" height="949" alt="dp_demo1" src="https://github.com/user-attachments/assets/c35b4e7c-bd65-4087-a87c-3506c9f16aed" />
 
 **Download the image package**：  
-![dp_demo2](https://github.com/user-attachments/assets/fc998a5d-7671-449c-a2d1-5ad6249eca62)  
+<img width="1192" height="937" alt="dp_demo2" src="https://github.com/user-attachments/assets/49a6d081-8839-4656-9580-247a512f7b2d" />
 
 The purpose of this project is to facilitate the use for users who prefer graphical interfaces.
 
