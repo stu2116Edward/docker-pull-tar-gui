@@ -916,7 +916,6 @@ class DockerPullerGUI(QMainWindow):
                 "search_tab": "镜像搜索",
                 "pull_tab": "镜像拉取",
                 "search_btn": "搜索",
-                "search_group": "镜像搜索",
                 "pull_btn": "拉取镜像",
                 "reset_btn": "重置",
                 "manage_registries": "管理仓库",
@@ -959,7 +958,6 @@ class DockerPullerGUI(QMainWindow):
         self.arch_label.setText(trans["arch_label"])
         self.layer_progress_label.setText(trans["layer_progress"])
         self.overall_progress_label.setText(trans["overall_progress"])
-        self.findChild(QGroupBox).setTitle(trans["search_group"])
         self.search_entry.setPlaceholderText({
             "zh": "输入镜像名称 (如: nginx)",
             "en": "Enter image name (e.g. nginx)"
