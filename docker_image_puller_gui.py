@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import json
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -11,6 +12,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QPushButton,
     QTextEdit,
+    QPlainTextEdit,
     QProgressBar,
     QMessageBox,
     QDialog,
@@ -27,7 +29,7 @@ from PyQt6.QtGui import QIcon, QFont, QColor, QPalette
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize
 
 # 导入核心功能
-from docker_image_puller import pull_image_logic, stop_event, VERSION
+from docker_image_puller import pull_image_logic, stop_event, VERSION, cancel_current_pull
 from docker_images_search import DockerImageSearcher
 
 class Worker(QObject):
@@ -154,6 +156,9 @@ class DockerPullerGUI(QMainWindow):
         settings_layout.addWidget(self.settings_button)
         settings_layout.addStretch()
         main_layout.addLayout(settings_layout)
+
+        # 添加“认证信息”选项卡，样式与“镜像拉取”一致
+        self.create_auth_tab()
 
     def create_search_tab(self):
         """创建搜索标签页"""
@@ -286,6 +291,8 @@ class DockerPullerGUI(QMainWindow):
             "en": "Registry:"
         }[self.language])
         self.registry_combobox = QComboBox()
+        # 支持手动输入仓库地址
+        self.registry_combobox.setEditable(True)
         self.load_registries()
         input_grid.addWidget(self.registry_label, 0, 0)
         input_grid.addWidget(self.registry_combobox, 0, 1)
@@ -334,6 +341,8 @@ class DockerPullerGUI(QMainWindow):
 
         input_group.setLayout(input_grid)
         pull_layout.addWidget(input_group)
+
+        # 角落控件在 init_ui 中设置
 
         # 按钮区域
         button_layout = QHBoxLayout()
@@ -404,6 +413,59 @@ class DockerPullerGUI(QMainWindow):
             self.search_entry
         ]:
             widget.setFont(font)
+
+    def create_auth_tab(self):
+        """创建认证信息选项卡（样式与镜像拉取一致）"""
+        auth_tab = QWidget()
+        auth_layout = QVBoxLayout(auth_tab)
+
+        # 分组框，与拉取页风格一致
+        self.auth_group = QGroupBox({
+            "zh": "认证信息",
+            "en": "Auth Info"
+        }[self.language])
+        group_layout = QVBoxLayout()
+
+        # JSON 编辑器，仅保留一种格式
+        self.auth_json_edit = QPlainTextEdit()
+        self.auth_json_edit.setFont(QFont("Consolas", 10))
+        placeholder = {
+            "zh": "{\n  \"registry\": \"your.registry.com\",\n  \"username\": \"your_user\",\n  \"password\": \"your_pass\"\n}",
+            "en": "{\n  \"registry\": \"your.registry.com\",\n  \"username\": \"your_user\",\n  \"password\": \"your_pass\"\n}"
+        }[self.language]
+        self.auth_json_edit.setPlaceholderText(placeholder)
+        # 默认写入占位示例，方便用户直接修改
+        self.auth_json_edit.setPlainText(placeholder)
+
+        # 操作按钮，保持一致的字号与样式
+        self.apply_auth_button = QPushButton({
+            "zh": "保存认证",
+            "en": "Save Auth"
+        }[self.language])
+        self.apply_auth_button.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
+        self.apply_button_style(self.apply_auth_button)
+        self.apply_auth_button.clicked.connect(self.apply_auth_json_from_editor)
+
+        group_layout.addWidget(self.auth_json_edit)
+        group_layout.addWidget(self.apply_auth_button)
+        self.auth_group.setLayout(group_layout)
+        auth_layout.addWidget(self.auth_group)
+
+        # 字体与拉取页一致
+        font = QFont("Microsoft YaHei", 12)
+        self.auth_group.setFont(font)
+        self.apply_auth_button.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
+
+        # 加载已保存的认证JSON
+        saved = self.read_saved_auth_json()
+        if saved:
+            self.auth_json_edit.setPlainText(saved)
+
+        # 添加到标签页
+        self.tabs.addTab(auth_tab, {
+            "zh": "认证信息",
+            "en": "Auth Info"
+        }[self.language])
 
     def search_images(self):
         """搜索Docker镜像"""
@@ -529,6 +591,8 @@ class DockerPullerGUI(QMainWindow):
         self.is_pulling = True
         self.pull_button.setEnabled(False)
 
+        # 不再提前应用认证信息；仅在后端遇到 401 时按需读取 auth.json
+
         self.worker = Worker(
             f"{image}:{tag}",
             self.registry_combobox.currentText(),
@@ -559,7 +623,8 @@ class DockerPullerGUI(QMainWindow):
     def reset_fields(self):
         """重置表单和搜索状态"""
         if self.is_pulling:
-            stop_event.set()
+            # 调用取消函数，立即终止网络请求并关闭会话
+            cancel_current_pull()
             self.is_pulling = False
             self.pull_button.setEnabled(True)
 
@@ -583,7 +648,8 @@ class DockerPullerGUI(QMainWindow):
     def load_registries(self):
         """加载仓库列表"""
         self.registry_combobox.clear()
-        self.registry_combobox.addItem("registry.hub.docker.com")
+        # 默认包含协议，鼓励用户在 registries.txt 中显式写出协议
+        self.registry_combobox.addItem("https://registry.hub.docker.com")
         if os.path.exists("registries.txt"):
             with open("registries.txt", "r", encoding="utf-8") as f:
                 registries = [line.strip() for line in f if line.strip()]
@@ -604,7 +670,7 @@ class DockerPullerGUI(QMainWindow):
             with open("registries.txt", "r", encoding="utf-8") as f:
                 registries_text.setText(f.read().strip())
         else:
-            registries_text.setText("registry.hub.docker.com\n")
+            registries_text.setText("https://registry.hub.docker.com\n")
 
         save_button = QPushButton({
             "zh": "保存",
@@ -629,12 +695,174 @@ class DockerPullerGUI(QMainWindow):
         save_button.clicked.connect(save_registries)
         dialog.exec()
 
-    def show_message(self, title, message):
+    def parse_auth_json(self, text=None):
+        """解析认证 JSON，支持以下结构：
+        - 单对象：{"registry": "host:port", "username": "u", "password": "p"}
+          兼容键名形如"registry1"等前缀。
+        - 列表：[{...}, {...}]，将选择与当前仓库匹配的条目；若无匹配，仅保存不应用。
+        - 映射：{"auths": {"host:port": {"username": "u", "password": "p"}}}
+        返回匹配当前仓库的凭据 dict 或 None（表示不应用，仅保存）。
+        """
+        if text is None:
+            text = ''
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            self.show_message({
+                "zh": "错误",
+                "en": "Error"
+            }[self.language], {
+                "zh": "认证信息 JSON 解析失败，请检查格式。",
+                "en": "Failed to parse auth JSON. Please check the format."
+            }[self.language])
+            return None
+
+        # 规范化比较：忽略协议与尾部斜杠差异
+        def _normalize_registry(reg):
+            if not reg:
+                return ''
+            r = str(reg).strip()
+            if r.startswith('http://'):
+                r = r[len('http://'):]
+            elif r.startswith('https://'):
+                r = r[len('https://'):]
+            return r.rstrip('/')
+
+        def _extract_registry_value(obj: dict):
+            # 首选标准键
+            if 'registry' in obj:
+                return obj.get('registry')
+            # 兼容形如 registry1/registry2 的键名
+            for k in obj.keys():
+                if isinstance(k, str) and k.lower().startswith('registry'):
+                    return obj.get(k)
+            return None
+
+        current_registry = self.registry_combobox.currentText() if hasattr(self, 'registry_combobox') else None
+        current_norm = _normalize_registry(current_registry) if current_registry else None
+
+        # 映射结构：{"auths": {"host:port": {"username": "u", "password": "p"}}}
+        if isinstance(data, dict) and isinstance(data.get('auths'), dict):
+            for reg, val in data.get('auths', {}).items():
+                if current_norm and _normalize_registry(reg) == current_norm and isinstance(val, dict):
+                    user = val.get('username')
+                    pwd = val.get('password')
+                    if user and pwd:
+                        return {"username": user, "password": pwd}
+            # 无匹配：静默返回 None（仅保存，不应用）
+            return None
+
+        # 单对象或普通字典
+        if isinstance(data, dict):
+            reg_val = _extract_registry_value(data)
+            if reg_val and (not current_norm or _normalize_registry(reg_val) == current_norm):
+                return {"username": data.get("username"), "password": data.get("password")}
+            # 无匹配或缺少 registry：静默返回 None（仅保存，不应用）
+            return None
+
+        # 列表结构：选择与当前仓库匹配的条目
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    reg_val = _extract_registry_value(item)
+                    if reg_val and current_norm and _normalize_registry(reg_val) == current_norm:
+                        user = item.get('username')
+                        pwd = item.get('password')
+                        if user and pwd:
+                            return {"username": user, "password": pwd}
+            # 无匹配：静默返回 None（仅保存，不应用）
+            return None
+
+        # 其他结构不支持
+        self.show_message({
+            "zh": "错误",
+            "en": "Error"
+        }[self.language], {
+            "zh": "认证信息 JSON 支持对象、数组或包含 auths 的对象。",
+            "en": "Auth JSON supports an object, an array, or an object with auths."
+        }[self.language])
+        return None
+
+    def apply_auth_env(self, creds):
+        """将认证信息写入环境变量，供拉取逻辑使用"""
+        vars_to_set = [
+            ("DOCKER_REGISTRY_USERNAME", "username"),
+            ("DOCKER_REGISTRY_PASSWORD", "password"),
+            ("REGISTRY_USERNAME", "username"),
+            ("REGISTRY_PASSWORD", "password")
+        ]
+        if creds:
+            for env_key, key in vars_to_set:
+                os.environ[env_key] = creds.get(key, "")
+            # 反馈日志
+            if hasattr(self, 'pull_log_text'):
+                self.pull_log_text.append({
+                    "zh": f"已应用认证信息。用户：{creds.get('username', '')}",
+                    "en": f"Auth applied. User: {creds.get('username', '')}"
+                }[self.language])
+        else:
+            for env_key, _ in vars_to_set:
+                if env_key in os.environ:
+                    os.environ.pop(env_key, None)
+
+    def apply_auth_json(self, text=None):
+        """解析并应用认证JSON，同时保存到本地文件。
+        当不匹配当前仓库或为列表/映射无直接匹配时，仍会保存文件，但不应用到环境变量。
+        后端会在拉取时按需读取并匹配使用。
+        """
+        # 先保存到文件
+        saved_ok = False
+        try:
+            text_to_save = text if text is not None else ''
+            with open("auth.json", "w", encoding="utf-8") as f:
+                f.write(text_to_save)
+            saved_ok = True
+        except Exception:
+            saved_ok = False
+
+        # 再尝试解析并应用到环境变量（若匹配当前仓库）
+        creds = self.parse_auth_json(text)
+        if creds:
+            self.apply_auth_env(creds)
+
+        # 成功保存后提示
+        if saved_ok:
+            self.show_message({
+                "zh": "保存成功",
+                "en": "Success"
+            }[self.language], {
+                "zh": "认证信息已保存。",
+                "en": "Auth JSON has been saved."
+            }[self.language], icon=QMessageBox.Icon.Information)
+
+    def apply_auth_json_from_editor(self):
+        """从选项卡编辑器读取并应用"""
+        text = self.auth_json_edit.toPlainText() if hasattr(self, 'auth_json_edit') else ''
+        self.apply_auth_json(text)
+
+    def read_saved_auth_json(self):
+        """读取本地保存的认证JSON文本（如果存在）"""
+        try:
+            if os.path.exists("auth.json"):
+                with open("auth.json", "r", encoding="utf-8") as f:
+                    return f.read()
+        except Exception:
+            return ""
+        return ""
+        # 旧的弹窗认证入口已被认证选项卡替代
+
+    def show_message(self, title, message, icon=None):
         """显示消息对话框"""
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle(title)
         msg_box.setText(message)
-        msg_box.setIcon(QMessageBox.Icon.Critical)
+        # 默认使用错误图标；若传入自定义图标则替换
+        if icon is None:
+            icon = QMessageBox.Icon.Critical
+        msg_box.setIcon(icon)
 
         # 设置 OK 按钮的样式
         ok_button = msg_box.addButton(QMessageBox.StandardButton.Ok)
@@ -715,7 +943,7 @@ class DockerPullerGUI(QMainWindow):
             palette.setColor(QPalette.ColorRole.PlaceholderText, Qt.GlobalColor.lightGray)
 
             dark_style = """
-                QTextEdit, QLineEdit {
+                QTextEdit, QLineEdit, QPlainTextEdit {
                     background-color: #252525;
                     color: white;
                     border: 1px solid #444;
@@ -801,7 +1029,7 @@ class DockerPullerGUI(QMainWindow):
             palette.setColor(QPalette.ColorRole.PlaceholderText, Qt.GlobalColor.gray)
 
             light_style = """
-                QTextEdit, QLineEdit {
+                QTextEdit, QLineEdit, QPlainTextEdit {
                     background-color: white;
                     color: black;
                     border: 1px solid #ccc;
@@ -915,6 +1143,7 @@ class DockerPullerGUI(QMainWindow):
                 "window_title": f"Docker 镜像工具 {VERSION}",
                 "search_tab": "镜像搜索",
                 "pull_tab": "镜像拉取",
+                "auth_tab": "认证信息",
                 "search_btn": "搜索",
                 "pull_btn": "拉取镜像",
                 "reset_btn": "重置",
@@ -924,12 +1153,16 @@ class DockerPullerGUI(QMainWindow):
                 "tag_label": "标签版本：",
                 "arch_label": "系统架构：",
                 "layer_progress": "当前层：",
-                "overall_progress": "总体进度："
+                "overall_progress": "总体进度：",
+                "auth_group": "",
+                "apply_auth": "保存认证",
+                "auth_placeholder": "{\n  \"registry\": \"your.registry.com\",\n  \"username\": \"your_user\",\n  \"password\": \"your_pass\"\n}"
             },
             "en": {
                 "window_title": f"Docker Image Tool {VERSION}",
                 "search_tab": "Image Search",
                 "pull_tab": "Image Pull",
+                "auth_tab": "Auth Info",
                 "search_btn": "Search",
                 "search_group": "Image Search",
                 "pull_btn": "Pull Image",
@@ -940,7 +1173,10 @@ class DockerPullerGUI(QMainWindow):
                 "tag_label": "Tag:",
                 "arch_label": "Architecture:",
                 "layer_progress": "Layer:",
-                "overall_progress": "Overall:"
+                "overall_progress": "Overall:",
+                "auth_group": "Auth Info",
+                "apply_auth": "Save Auth",
+                "auth_placeholder": "{\n  \"registry\": \"your.registry.com\",\n  \"username\": \"your_user\",\n  \"password\": \"your_pass\"\n}"
             }
         }
         trans = translations[self.language]
@@ -948,6 +1184,8 @@ class DockerPullerGUI(QMainWindow):
         self.setWindowTitle(trans["window_title"])
         self.tabs.setTabText(0, trans["search_tab"])
         self.tabs.setTabText(1, trans["pull_tab"])
+        if self.tabs.count() > 2:
+            self.tabs.setTabText(2, trans["auth_tab"])
         self.search_button.setText(trans["search_btn"])
         self.pull_button.setText(trans["pull_btn"])
         self.reset_button.setText(trans["reset_btn"])
@@ -962,6 +1200,13 @@ class DockerPullerGUI(QMainWindow):
             "zh": "输入镜像名称 (如: nginx)",
             "en": "Enter image name (e.g. nginx)"
         }[self.language])
+        # 更新认证选项卡控件文本
+        if hasattr(self, "auth_group"):
+            self.auth_group.setTitle(trans["auth_group"])
+        if hasattr(self, "apply_auth_button"):
+            self.apply_auth_button.setText(trans["apply_auth"])
+        if hasattr(self, "auth_json_edit"):
+            self.auth_json_edit.setPlaceholderText(trans["auth_placeholder"])
 
     def show_settings_dialog(self):
         """显示设置对话框"""
