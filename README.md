@@ -15,6 +15,10 @@ Currently only supports Chinese and English.
 
 The purpose of this project is to facilitate the use for users who prefer graphical interfaces.
 
+**Private repository**：  
+<img width="1190" height="928" alt="屏幕截图 2025-12-05 125650" src="https://github.com/user-attachments/assets/676e8258-fe0b-43d3-a92f-71b65f939595" />  
+
+Use JSON format to add the private repository address, and the request should use the v2 format.
 
 ### How to use it in Linux
 Get the script：
