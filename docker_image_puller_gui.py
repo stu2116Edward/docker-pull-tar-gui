@@ -86,26 +86,29 @@ DEFAULT_RESULT_LIMIT = 25
 
 class SearchWorker(QObject):
     log_signal = pyqtSignal(str)
-    search_result_signal = pyqtSignal(list)
+    search_result_signal = pyqtSignal(int, list)
 
-    def __init__(self, search_term, limit=DEFAULT_RESULT_LIMIT):
+    def __init__(self, search_term, limit=DEFAULT_RESULT_LIMIT, generation=0):
         super().__init__()
         self.search_term = search_term
         self.limit = limit
+        self.generation = generation
         self.searcher = DockerImageSearcher()
 
     def run(self):
         try:
             self.log_signal.emit(f"正在搜索镜像: {self.search_term}...\n")
             QApplication.processEvents()
-            results = self.searcher.search_images(self.search_term, limit=self.limit)
+            results = self.searcher.search_images(self.search_term, limit=self.limit) or []
             if results:
                 self.log_signal.emit(f"从 {self.searcher.current_registry} 找到 {len(results)} 个结果:\n")
-                self.search_result_signal.emit(results)
+                self.search_result_signal.emit(self.generation, results)
             else:
                 self.log_signal.emit("没有找到匹配的镜像\n")
+                self.search_result_signal.emit(self.generation, [])
         except Exception as e:
             self.log_signal.emit(f"[ERROR] 搜索镜像时出错: {e}\n")
+            self.search_result_signal.emit(self.generation, [])
 
 
 class DockerPullerGUI(QMainWindow):
@@ -117,6 +120,7 @@ class DockerPullerGUI(QMainWindow):
         self.is_searching = False
         self.searcher = DockerImageSearcher()
         self.result_limit = DEFAULT_RESULT_LIMIT
+        self.search_generation = 0
 
         # 定义图标路径
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -500,12 +504,17 @@ class DockerPullerGUI(QMainWindow):
             "en": "Searching, please wait..."
         }[self.language])
 
-        self.worker = SearchWorker(search_term, self.result_limit)
+        # 递增搜索代次，用于忽略旧线程的返回结果
+        self.search_generation += 1
+        self.worker = SearchWorker(search_term, self.result_limit, generation=self.search_generation)
         self.worker.search_result_signal.connect(self.display_search_results)
         threading.Thread(target=self.worker.run).start()
 
-    def display_search_results(self, results):
+    def display_search_results(self, generation, results):
         """显示搜索结果"""
+        # 忽略已被重置的旧搜索线程回传的结果
+        if generation != self.search_generation:
+            return
         self.is_searching = False
         self.search_button.setEnabled(True)
 
@@ -637,8 +646,8 @@ class DockerPullerGUI(QMainWindow):
         self.layer_progress_bar.setValue(0)
         self.overall_progress_bar.setValue(0)
 
-        # 搜索区重置
-        self.search_entry.clear()
+        # 搜索区重置（保留搜索词，需手动点击“搜索”）
+        self.search_generation += 1  # 使旧线程结果失效
         self.search_result_table.setRowCount(0)
         self.search_source_label.setText("")
         self.is_searching = False
