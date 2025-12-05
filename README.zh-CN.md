@@ -12,6 +12,10 @@
 
 这个项目的目的在于方便那些喜欢图形界面的用户使用  
 
+**私有仓库**
+<img width="1187" height="940" alt="屏幕截图 2025-12-05 125725" src="https://github.com/user-attachments/assets/36ec8602-562c-4807-a678-5cbca1436c27" />
+
+使用json格式添加私有仓库地址，请求采用v2格式
 
 ### 如何在Linux中使用
 获取脚本：
@@ -80,4 +84,3 @@ pyinstaller -F -w -i favicon.ico docker_image_puller_gui.py --add-data "logo.ico
 ```
 pyinstaller -F -i favicon.ico docker_image_puller.py
 ```
-
