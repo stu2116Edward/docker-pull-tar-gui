@@ -600,6 +600,18 @@ def download_layers(session, scheme, registry, repository, layers, auth_head, im
             if overall_progress_callback:
                 overall_progress_callback(int(overall_progress / total_layers * 100))
 
+        # 写入 manifest.json 和 repositories，确保 docker load 后包含正确的 RepoTags
+        try:
+            with open(f'{imgdir}/manifest.json', 'w', encoding='utf-8') as file:
+                json.dump(content, file)
+            repo_tag = repository
+            with open(f'{imgdir}/repositories', 'w', encoding='utf-8') as file:
+                json.dump({repo_tag: {tag: fake_layerid}}, file)
+        except Exception as e:
+            if log_callback:
+                log_callback(f"[ERROR] 写入 manifest/repositories 失败: {e}\n")
+            raise
+
         return True
 
     except Exception as e:
@@ -607,12 +619,7 @@ def download_layers(session, scheme, registry, repository, layers, auth_head, im
             log_callback(f"[ERROR] 下载镜像层失败: {e}\n")
         raise
 
-    with open(f'{imgdir}/manifest.json', 'w') as file:
-        json.dump(content, file)
-
-    repo_tag = repository
-    with open(f'{imgdir}/repositories', 'w') as file:
-        json.dump({repo_tag: {tag: fake_layerid}}, file)
+    # 注意：manifest.json 与 repositories 已在成功路径写入；此处不再重复写入
 
 def create_image_tar(imgdir, repository, arch):
     """将镜像打包为 tar 文件，文件名基于解析后的 repository"""
