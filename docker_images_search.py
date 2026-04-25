@@ -17,7 +17,7 @@ class DockerImageSearcher:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Accept": "application/json",
         }
-        self.timeout = 3  # 请求超时时间
+        self.timeout = 5  # 请求超时时间
     
     def _load_registries(self) -> List[str]:
         """加载注册表地址列表，优先使用官方地址"""
@@ -39,6 +39,10 @@ class DockerImageSearcher:
     def search_images(self, term: str, limit: int = 25) -> Optional[List[Dict]]:
         """
         搜索Docker镜像
+        支持多种接口：
+        1. Docker Hub搜索API: /v2/search/repositories/?query=xxx
+        2. OCI标准接口: /v2/<name>/tags/list
+        3. 私有仓库目录接口: /v2/_catalog
         """
         params = {
             "query": term,
@@ -50,11 +54,13 @@ class DockerImageSearcher:
             if not registry.startswith(("http://", "https://")):
                 registry = f"https://{registry}"
             
-            api_url = f"{registry}/v2/search/repositories/"
             self.current_registry = registry
             
             try:
                 print(f"尝试从 {registry} 搜索...", flush=True)
+                
+                # 1. 首先尝试 Docker Hub 标准搜索 API
+                api_url = f"{registry}/v2/search/repositories/"
                 response = requests.get(
                     api_url,
                     headers=self.headers,
@@ -65,23 +71,76 @@ class DockerImageSearcher:
                 if response.status_code == 200:
                     data = response.json()
                     
-                    if not data.get("results"):
-                        print(f"从 {registry} 获取到空结果，尝试下一个注册表...", flush=True)
-                        continue
+                    if data.get("results"):
+                        results = []
+                        for item in data.get("results", []):
+                            results.append({
+                                "name": item.get("repo_name", ""),
+                                "description": (item.get("short_description", "") or "")[:60],
+                                "stars": item.get("star_count", 0),
+                                "official": "[OK]" if item.get("is_official", False) else "",
+                                "automated": "[OK]" if item.get("is_automated", False) else "",
+                            })
+                        return results
+                    else:
+                        print(f"从 {registry} 获取到空结果，尝试其他接口...", flush=True)
+                
+                # 2. 尝试 OCI 标准接口 /v2/<name>/tags/list
+                print(f"尝试 OCI 标准接口...", flush=True)
+                oci_url = f"{registry}/v2/{term}/tags/list"
+                oci_response = requests.get(
+                    oci_url,
+                    headers=self.headers,
+                    timeout=self.timeout
+                )
+                
+                if oci_response.status_code == 200:
+                    oci_data = oci_response.json()
+                    tags = oci_data.get("tags", [])
+                    if tags:
+                        # 返回镜像信息，包含标签列表
+                        return [{
+                            "name": term,
+                            "description": f"Tags: {', '.join(tags[:5])}{'...' if len(tags) > 5 else ''}",
+                            "stars": 0,
+                            "official": "",
+                            "automated": "",
+                        }]
+                elif oci_response.status_code == 404:
+                    print(f"OCI接口返回404，镜像可能不存在", flush=True)
+                
+                # 3. 尝试私有仓库目录接口 /v2/_catalog
+                print(f"尝试私有仓库目录接口...", flush=True)
+                catalog_url = f"{registry}/v2/_catalog"
+                catalog_response = requests.get(
+                    catalog_url,
+                    headers=self.headers,
+                    timeout=self.timeout
+                )
+                
+                if catalog_response.status_code == 200:
+                    catalog_data = catalog_response.json()
+                    repositories = catalog_data.get("repositories", [])
                     
-                    results = []
-                    for item in data.get("results", []):
-                        results.append({
-                            "name": item.get("repo_name", ""),
-                            "description": (item.get("short_description", "") or "")[:60],
-                            "stars": item.get("star_count", 0),
-                            "official": "[OK]" if item.get("is_official", False) else "",
-                            "automated": "[OK]" if item.get("is_automated", False) else "",
-                        })
-                    return results
-                else:
-                    print(f"从 {registry} 获取数据失败，状态码: {response.status_code}", flush=True)
-                    continue
+                    # 过滤匹配的仓库
+                    matching_repos = [repo for repo in repositories if term.lower() in repo.lower()]
+                    
+                    if matching_repos:
+                        results = []
+                        for repo in matching_repos[:limit]:
+                            results.append({
+                                "name": repo,
+                                "description": "",
+                                "stars": 0,
+                                "official": "",
+                                "automated": "",
+                            })
+                        return results
+                    else:
+                        print(f"目录接口未找到匹配镜像", flush=True)
+                
+                print(f"从 {registry} 所有接口均无法获取数据", flush=True)
+                continue
                 
             except requests.exceptions.Timeout:
                 print(f"连接 {registry} 超时，尝试下一个注册表...", flush=True)
