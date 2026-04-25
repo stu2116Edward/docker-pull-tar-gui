@@ -1,6 +1,9 @@
 import os
 import sys
 import threading
+import json
+import ctypes
+import time
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -11,7 +14,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QPushButton,
     QTextEdit,
-    QProgressBar,
+    QPlainTextEdit,
     QMessageBox,
     QDialog,
     QWidget,
@@ -24,86 +27,156 @@ from PyQt6.QtWidgets import (
     QMenu
 )
 from PyQt6.QtGui import QIcon, QFont, QColor, QPalette
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize, QTimer
 
 # 导入核心功能
-from docker_image_puller import pull_image_logic, stop_event, VERSION
+from docker_image_puller import pull_image_logic, stop_event, VERSION, cancel_current_pull
 from docker_images_search import DockerImageSearcher
 
 class Worker(QObject):
     """用于拉取镜像的后台线程"""
-    log_signal = pyqtSignal(str)
-    layer_progress_signal = pyqtSignal(int)
-    overall_progress_signal = pyqtSignal(int)
+    log_signal = pyqtSignal(int, str)  # 普通日志信号(代次,消息)
+    progress_signal = pyqtSignal(int, str)  # 进度条专用信号(代次,消息)
+    finished_signal = pyqtSignal(int)  # 完成信号(代次)
 
-    def __init__(self, image, registry, arch, language):
+    def __init__(self, image, registry, arch, language, generation=0, username=None, password=None):
         super().__init__()
         self.image = image
         self.registry = registry
         self.arch = arch
         self.language = language
+        self.generation = generation
+        self.username = username
+        self.password = password
 
     def run(self):
         try:
             log_msg = {
                 "zh": f"开始拉取镜像：{self.image}\n",
                 "en": f"Pulling image: {self.image}\n"
-            }
-            self.log_signal.emit(log_msg[self.language])
+            }[self.language]
+            self.log_signal.emit(self.generation, log_msg)
 
+            # 如果有临时认证信息，显示在日志中
+            if self.username and self.password:
+                auth_msg = {
+                    "zh": f"[INFO] 使用认证用户: {self.username}\n",
+                    "en": f"[INFO] Using auth user: {self.username}\n"
+                }[self.language]
+                self.log_signal.emit(self.generation, auth_msg)
+
+            # 调用拉取逻辑，传入认证信息
             pull_image_logic(
                 self.image,
-                self.registry,
-                self.arch,
-                log_callback=self.log_callback,
-                layer_progress_callback=self.layer_progress_callback,
-                overall_progress_callback=self.overall_progress_callback
+                registry=self.registry,
+                arch=self.arch,
+                username=self.username,
+                password=self.password,
+                log_callback=self._log_callback
             )
 
         except Exception as e:
             error_msg = {
                 "zh": f"[ERROR] 发生错误：{e}\n",
                 "en": f"[ERROR] Error occurred: {e}\n"
-            }
-            self.log_callback(error_msg[self.language])
+            }[self.language]
+            self.log_signal.emit(self.generation, error_msg)
         finally:
-            self.layer_progress_callback(0)
-            self.overall_progress_callback(0)
+            self.finished_signal.emit(self.generation)
 
-    def log_callback(self, message):
-        self.log_signal.emit(message)
-
-    def layer_progress_callback(self, value):
-        self.layer_progress_signal.emit(value)
-
-    def overall_progress_callback(self, value):
-        self.overall_progress_signal.emit(value)
+    def _log_callback(self, message):
+        """处理日志消息，区分普通日志和进度更新"""
+        if not message:
+            return
+        # 去除末尾的换行符，避免空行
+        message = message.rstrip('\n')
+        if not message:
+            return
+        # 检查是否是进度消息（包含 ⬇️ ✅ 📊 或 |███| 进度条格式）
+        if ('⬇️' in message or '✅' in message or '📊' in message or 
+            '█' in message or '░' in message):
+            # 进度消息发送到进度信号
+            self.progress_signal.emit(self.generation, message)
+        else:
+            # 普通日志消息
+            self.log_signal.emit(self.generation, message)
 
 # 定义默认输出条数
 DEFAULT_RESULT_LIMIT = 25
 
+
+def force_kill_thread(thread):
+    """强制终止线程（使用ctypes）"""
+    if not thread or not thread.is_alive():
+        return False
+    
+    try:
+        tid = thread.ident
+        if tid is None:
+            return False
+        
+        # 注入SystemExit异常来终止线程
+        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_long(tid),
+            ctypes.py_object(SystemExit)
+        )
+        if res > 1:
+            # 如果返回值大于1，说明出现异常，需要重新设置来清理
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(tid), 0)
+            return False
+        return res == 1
+    except Exception as e:
+        import logging
+        logging.error(f"强制终止线程失败: {e}")
+        return False
+
+
+def terminate_threads(threads, timeout=0.5):
+    """批量终止线程，先尝试join，再强制终止"""
+    if not threads:
+        return
+    
+    # 首先发送停止信号
+    stop_event.set()
+    
+    # 尝试等待线程正常结束
+    for thread in threads:
+        if thread and thread.is_alive():
+            try:
+                thread.join(timeout=timeout)
+            except Exception:
+                pass
+    
+    # 对仍然活动的线程强制终止
+    for thread in threads:
+        if thread and thread.is_alive():
+            force_kill_thread(thread)
+
 class SearchWorker(QObject):
     log_signal = pyqtSignal(str)
-    search_result_signal = pyqtSignal(list)
+    search_result_signal = pyqtSignal(int, list)
 
-    def __init__(self, search_term, limit=DEFAULT_RESULT_LIMIT):
+    def __init__(self, search_term, limit=DEFAULT_RESULT_LIMIT, generation=0):
         super().__init__()
         self.search_term = search_term
         self.limit = limit
+        self.generation = generation
         self.searcher = DockerImageSearcher()
 
     def run(self):
         try:
             self.log_signal.emit(f"正在搜索镜像: {self.search_term}...\n")
             QApplication.processEvents()
-            results = self.searcher.search_images(self.search_term, limit=self.limit)
+            results = self.searcher.search_images(self.search_term, limit=self.limit) or []
             if results:
                 self.log_signal.emit(f"从 {self.searcher.current_registry} 找到 {len(results)} 个结果:\n")
-                self.search_result_signal.emit(results)
+                self.search_result_signal.emit(self.generation, results)
             else:
                 self.log_signal.emit("没有找到匹配的镜像\n")
+                self.search_result_signal.emit(self.generation, [])
         except Exception as e:
             self.log_signal.emit(f"[ERROR] 搜索镜像时出错: {e}\n")
+            self.search_result_signal.emit(self.generation, [])
 
 
 class DockerPullerGUI(QMainWindow):
@@ -115,6 +188,16 @@ class DockerPullerGUI(QMainWindow):
         self.is_searching = False
         self.searcher = DockerImageSearcher()
         self.result_limit = DEFAULT_RESULT_LIMIT
+        self.search_generation = 0
+        self.worker_generation = 0  # Worker代次，防止旧worker输出干扰
+
+        # 跟踪活跃的后台线程
+        self.pull_thread = None  # 拉取线程
+        self.search_thread = None  # 搜索线程
+
+        # 分离搜索和拉取的 worker 变量
+        self.pull_worker = None   # 拉取专用
+        self.search_worker = None # 搜索专用
 
         # 定义图标路径
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -126,7 +209,7 @@ class DockerPullerGUI(QMainWindow):
         self.update_ui_text()
 
     def init_ui(self, logo_icon_path, settings_icon_path):
-        self.setWindowTitle(f"Docker 镜像工具 {VERSION}")
+        self.setWindowTitle(f"Docker 镜像打包工具 {VERSION}")
         self.setGeometry(100, 100, 800, 600)
         self.setWindowIcon(QIcon(logo_icon_path))
 
@@ -154,6 +237,9 @@ class DockerPullerGUI(QMainWindow):
         settings_layout.addWidget(self.settings_button)
         settings_layout.addStretch()
         main_layout.addLayout(settings_layout)
+
+        # 添加"认证信息"选项卡
+        self.create_auth_tab()
 
     def create_search_tab(self):
         """创建搜索标签页"""
@@ -211,11 +297,11 @@ class DockerPullerGUI(QMainWindow):
 
         # 初始化表头颜色
         self.update_search_table_header_style()
-        
+
         # 添加右键复制输出信息
         self.search_result_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.search_result_table.customContextMenuRequested.connect(self.show_table_context_menu)
-        
+
     def update_search_table_header_style(self):
         """根据主题设置表头颜色"""
         header = self.search_result_table.horizontalHeader()
@@ -237,7 +323,7 @@ class DockerPullerGUI(QMainWindow):
                     font-weight: bold;
                 }
             """)
-            
+
     def show_table_context_menu(self, pos):
         index = self.search_result_table.indexAt(pos)
         if not index.isValid():
@@ -250,13 +336,34 @@ class DockerPullerGUI(QMainWindow):
         # 主题自适应
         if self.theme_mode == "dark":
             menu.setStyleSheet("""
-                QMenu { background-color: #353535; color: white; }
-                QMenu::item:selected { background-color: #636363; }
+                QMenu { 
+                    background-color: #353535; 
+                    color: white; 
+                    border: 1px solid #555;
+                }
+                QMenu::item {
+                    padding: 5px 20px;
+                    color: white;
+                }
+                QMenu::item:selected { 
+                    background-color: #636363; 
+                }
             """)
         else:
             menu.setStyleSheet("""
-                QMenu { background-color: #fff; color: black; }
-                QMenu::item:selected { background-color: #cceeff; }
+                QMenu { 
+                    background-color: #ffffff; 
+                    color: black; 
+                    border: 1px solid #ccc;
+                }
+                QMenu::item {
+                    padding: 5px 20px;
+                    color: black;
+                }
+                QMenu::item:selected { 
+                    background-color: #0078d7; 
+                    color: white;
+                }
             """)
         copy_action.triggered.connect(lambda: self.copy_table_row(index.row()))
         menu.exec(self.search_result_table.viewport().mapToGlobal(pos))
@@ -286,11 +393,13 @@ class DockerPullerGUI(QMainWindow):
             "en": "Registry:"
         }[self.language])
         self.registry_combobox = QComboBox()
+        # 支持手动输入仓库地址
+        self.registry_combobox.setEditable(True)
         self.load_registries()
         input_grid.addWidget(self.registry_label, 0, 0)
         input_grid.addWidget(self.registry_combobox, 0, 1)
 
-        # 添加“管理仓库”按钮
+        # 添加"管理仓库"按钮
         self.manage_registries_button = QPushButton({
             "zh": "管理仓库",
             "en": "Manage Registries"
@@ -326,11 +435,53 @@ class DockerPullerGUI(QMainWindow):
         }[self.language])
         self.arch_combobox = QComboBox()
         self.arch_combobox.addItems([
-            "amd64", "arm64", "arm32v7", "arm32v5", "i386", "ppc64le", "s390x", "mips64le"
+            "amd64", "arm32v5", "arm32v6", "arm32v7", "arm64v8", "i386", "ppc64le", "riscv64", "s390x"
         ])
         self.arch_combobox.setCurrentIndex(0)
+        # 设置为可编辑，保留右侧下拉箭头
+        self.arch_combobox.setEditable(True)
         input_grid.addWidget(self.arch_label, 3, 0)
         input_grid.addWidget(self.arch_combobox, 3, 1)
+
+        # 认证区域 - 直接显示，不再使用下拉
+        self.auth_label = QLabel({
+            "zh": "认证信息：",
+            "en": "Auth Info:"
+        }[self.language])
+        # 设置字体与上方标签一致
+        auth_label_font = QFont("Microsoft YaHei", 12)
+        self.auth_label.setFont(auth_label_font)
+        input_grid.addWidget(self.auth_label, 4, 0)
+
+        # 认证输入区域 - 横向布局
+        self.auth_input_widget = QWidget()
+        auth_input_layout = QHBoxLayout(self.auth_input_widget)
+        auth_input_layout.setContentsMargins(0, 0, 0, 0)
+        auth_input_layout.setSpacing(10)
+
+        # 用户名
+        self.username_entry = QLineEdit()
+        self.username_entry.setPlaceholderText({
+            "zh": "用户名（可选）",
+            "en": "Username (optional)"
+        }[self.language])
+        # 设置字体与上方输入框一致
+        auth_input_font = QFont("Microsoft YaHei", 12)
+        self.username_entry.setFont(auth_input_font)
+        auth_input_layout.addWidget(self.username_entry)
+
+        # 密码
+        self.password_entry = QLineEdit()
+        self.password_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_entry.setPlaceholderText({
+            "zh": "密码（可选）",
+            "en": "Password (optional)"
+        }[self.language])
+        # 设置字体与上方输入框一致
+        self.password_entry.setFont(auth_input_font)
+        auth_input_layout.addWidget(self.password_entry)
+
+        input_grid.addWidget(self.auth_input_widget, 4, 1)
 
         input_group.setLayout(input_grid)
         pull_layout.addWidget(input_group)
@@ -356,38 +507,16 @@ class DockerPullerGUI(QMainWindow):
         button_layout.addWidget(self.pull_button)
         button_layout.addWidget(self.reset_button)
         button_layout.addWidget(self.manage_registries_button)
-        button_layout.setStretch(0, 1)  # 拉取镜像按钮自适应拉伸
-        button_layout.setStretch(1, 1)  # 重置按钮自适应拉伸
-        button_layout.setStretch(2, 1)  # 管理仓库按钮自适应拉伸
+        button_layout.setStretch(0, 1)
+        button_layout.setStretch(1, 1)
+        button_layout.setStretch(2, 1)
 
         pull_layout.addLayout(button_layout)
 
-        # 日志区域
+        # 日志区域（包含动态刷新的进度信息）- 扩展以填充更多空间
         self.pull_log_text = QTextEdit()
         self.pull_log_text.setReadOnly(True)
-        pull_layout.addWidget(self.pull_log_text)
-
-        # 进度条
-        progress_layout = QHBoxLayout()
-        self.layer_progress_label = QLabel({
-            "zh": "当前层：",
-            "en": "Layer:"
-        }[self.language])
-        self.layer_progress_bar = QProgressBar()
-        self.layer_progress_bar.setValue(0)
-
-        self.overall_progress_label = QLabel({
-            "zh": "总体进度：",
-            "en": "Overall:"
-        }[self.language])
-        self.overall_progress_bar = QProgressBar()
-        self.overall_progress_bar.setValue(0)
-
-        progress_layout.addWidget(self.layer_progress_label)
-        progress_layout.addWidget(self.layer_progress_bar)
-        progress_layout.addWidget(self.overall_progress_label)
-        progress_layout.addWidget(self.overall_progress_bar)
-        pull_layout.addLayout(progress_layout)
+        pull_layout.addWidget(self.pull_log_text, stretch=1)
 
         self.tabs.addTab(pull_tab, {
             "zh": "镜像拉取",
@@ -404,6 +533,56 @@ class DockerPullerGUI(QMainWindow):
             self.search_entry
         ]:
             widget.setFont(font)
+
+    def create_auth_tab(self):
+        """创建认证信息选项卡（样式与镜像拉取一致）"""
+        auth_tab = QWidget()
+        auth_layout = QVBoxLayout(auth_tab)
+
+        # 分组框，与拉取页风格一致 - 始终不显示标题，避免与Tab重复
+        self.auth_group = QGroupBox()  # 不设置标题
+        group_layout = QVBoxLayout()
+
+        # JSON 编辑器，仅保留一种格式
+        self.auth_json_edit = QPlainTextEdit()
+        self.auth_json_edit.setFont(QFont("Consolas", 10))
+        placeholder = {
+            "zh": "{\n  \"registry\": \"your.registry.com\",\n  \"username\": \"your_user\",\n  \"password\": \"your_pass\"\n}",
+            "en": "{\n  \"registry\": \"your.registry.com\",\n  \"username\": \"your_user\",\n  \"password\": \"your_pass\"\n}"
+        }[self.language]
+        self.auth_json_edit.setPlaceholderText(placeholder)
+        # 默认写入占位示例，方便用户直接修改
+        self.auth_json_edit.setPlainText(placeholder)
+
+        # 操作按钮，保持一致的字号与样式
+        self.apply_auth_button = QPushButton({
+            "zh": "保存认证",
+            "en": "Save Auth"
+        }[self.language])
+        self.apply_auth_button.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
+        self.apply_button_style(self.apply_auth_button)
+        self.apply_auth_button.clicked.connect(self.apply_auth_json_from_editor)
+
+        group_layout.addWidget(self.auth_json_edit)
+        group_layout.addWidget(self.apply_auth_button)
+        self.auth_group.setLayout(group_layout)
+        auth_layout.addWidget(self.auth_group)
+
+        # 字体与拉取页一致
+        font = QFont("Microsoft YaHei", 12)
+        self.auth_group.setFont(font)
+        self.apply_auth_button.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
+
+        # 加载已保存的认证JSON
+        saved = self.read_saved_auth_json()
+        if saved:
+            self.auth_json_edit.setPlainText(saved)
+
+        # 添加到标签页
+        self.tabs.addTab(auth_tab, {
+            "zh": "认证信息",
+            "en": "Auth Info"
+        }[self.language])
 
     def search_images(self):
         """搜索Docker镜像"""
@@ -432,24 +611,32 @@ class DockerPullerGUI(QMainWindow):
         self.search_button.setEnabled(False)
 
         self.search_result_table.setRowCount(0)
-        
+
         self.search_source_label.setText({
             "zh": "正在搜索，请稍候...",
             "en": "Searching, please wait..."
         }[self.language])
 
-        self.worker = SearchWorker(search_term, self.result_limit)
-        self.worker.search_result_signal.connect(self.display_search_results)
-        threading.Thread(target=self.worker.run).start()
+        # 递增搜索代次，用于忽略旧线程的返回结果
+        self.search_generation += 1
+        self.search_worker = SearchWorker(search_term, self.result_limit, generation=self.search_generation)
+        self.search_worker.search_result_signal.connect(self.display_search_results)
+        
+        # 创建并跟踪搜索线程
+        self.search_thread = threading.Thread(target=self.search_worker.run)
+        self.search_thread.start()
 
-    def display_search_results(self, results):
+    def display_search_results(self, generation, results):
         """显示搜索结果"""
+        # 忽略已被重置的旧搜索线程回传的结果
+        if generation != self.search_generation:
+            return
         self.is_searching = False
         self.search_button.setEnabled(True)
 
         self.search_result_table.setRowCount(0)
         # 获取来源
-        source = getattr(self.worker.searcher, "current_registry", "未知来源")
+        source = getattr(self.search_worker.searcher, "current_registry", "未知来源") if self.search_worker else "未知来源"
         if "://" in source:
             source = source.split("://", 1)[1]
         if results:
@@ -475,6 +662,8 @@ class DockerPullerGUI(QMainWindow):
             self.search_result_table.setItem(0, 1, QTableWidgetItem(""))
             self.search_result_table.setItem(0, 2, QTableWidgetItem(""))
             self.search_result_table.setItem(0, 3, QTableWidgetItem(""))
+            self.search_result_table.setItem(0, 3, QTableWidgetItem(""))
+            self.search_result_table.setItem(0, 4, QTableWidgetItem(""))
 
         # 每次都刷新表头颜色
         self.update_search_table_header_style()
@@ -528,62 +717,235 @@ class DockerPullerGUI(QMainWindow):
 
         self.is_pulling = True
         self.pull_button.setEnabled(False)
+        
+        # 清空日志区域，显示等待进度条
+        self.pull_log_text.clear()
+        self.pull_log_text.append("准备下载...")
 
-        self.worker = Worker(
+        # 获取认证信息（直接读取输入框）
+        username = self.username_entry.text().strip()
+        password = self.password_entry.text().strip()
+
+        # 如果存在旧worker，先终止它并等待完成
+        if self.pull_worker is not None:
+            # 标记为不再使用，让旧线程自然结束
+            self.pull_worker = None
+
+        # 强制处理所有待处理事件，确保旧连接清理完成
+        QApplication.processEvents()
+
+        # 断开之前可能存在的所有信号连接
+        try:
+            # 清理可能残留的信号连接
+            if hasattr(self, '_log_slot'):
+                self._log_slot.disconnect()
+        except:
+            pass
+
+        # 递增worker代次，用于过滤旧worker的信号
+        self.worker_generation += 1
+        current_generation = self.worker_generation
+
+        self.pull_worker = Worker(
             f"{image}:{tag}",
             self.registry_combobox.currentText(),
             self.arch_combobox.currentText(),
-            self.language
+            self.language,
+            generation=current_generation,
+            username=username,
+            password=password
         )
 
-        self.worker.log_signal.connect(self.pull_log_text.append)
-        self.worker.layer_progress_signal.connect(self.layer_progress_bar.setValue)
-        self.worker.overall_progress_signal.connect(self.overall_progress_bar.setValue)
+        # 连接信号，使用包装函数来过滤旧worker的信号
+        self.pull_worker.log_signal.connect(self._handle_log_signal)
+        self.pull_worker.progress_signal.connect(self._handle_progress_signal)
+        self.pull_worker.finished_signal.connect(self._handle_finished_signal)
 
-        # 拉取完成后恢复按钮
-        def on_pull_finished(*args, **kwargs):
-            self.is_pulling = False
-            self.pull_button.setEnabled(True)
-        # 连接线程结束信号
-        thread = threading.Thread(target=self.worker.run)
-        thread.start()
-        # 轮询线程状态，拉取完成后恢复按钮
-        def check_thread():
-            if thread.is_alive():
-                QTimer.singleShot(200, check_thread)
-            else:
-                on_pull_finished()
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(200, check_thread)
+        # 启动线程并跟踪
+        self.pull_thread = threading.Thread(target=self.pull_worker.run)
+        self.pull_thread.start()
 
-    def reset_fields(self):
-        """重置表单和搜索状态"""
-        if self.is_pulling:
-            stop_event.set()
-            self.is_pulling = False
-            self.pull_button.setEnabled(True)
+    def _handle_log_signal(self, generation, message):
+        """处理日志信号，只接受当前代次的worker消息"""
+        if generation == self.worker_generation:
+            # 去除末尾换行符避免空行，QTextEdit.append会自动添加换行
+            message = message.rstrip('\n')
+            if message:
+                self.pull_log_text.append(message)
 
-        # 拉取区重置
-        self.pull_log_text.clear()
+    def _handle_progress_signal(self, generation, progress_text):
+        """处理进度信号，只接受当前代次的worker消息"""
+        if generation == self.worker_generation:
+            self._update_progress_area(progress_text)
+
+    def _handle_finished_signal(self, generation):
+        """处理完成信号，只接受当前代次的worker消息"""
+        if generation == self.worker_generation:
+            self.on_pull_finished()
+
+    def _update_progress_area(self, progress_text):
+        """更新进度显示 - 在同一个日志框中动态替换进度信息"""
+        # 获取当前文本
+        current_text = self.pull_log_text.toPlainText()
+        lines = current_text.split('\n')
+        
+        # 检查是否已有进度行（以 ⬇️ ✅ 📊 █ ░ 开头）
+        progress_start = -1
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].startswith(('  ⬇️', '  ✅', '📊')) or '█' in lines[i] or '░' in lines[i]:
+                progress_start = i
+            elif progress_start != -1:
+                break
+        
+        if progress_start != -1:
+            # 移除旧进度行
+            lines = lines[:progress_start]
+        
+        # 添加新进度文本
+        new_text = '\n'.join(lines)
+        if new_text and not new_text.endswith('\n'):
+            new_text += '\n'
+        new_text += progress_text
+        
+        # 更新文本
+        self.pull_log_text.setPlainText(new_text)
+        
+        # 滚动到底部
+        scrollbar = self.pull_log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def on_pull_finished(self):
+        """拉取完成后的处理"""
+        self.is_pulling = False
+        self.pull_button.setEnabled(True)
+        # 重置stop_event，允许下一次下载
+        from docker_image_puller import stop_event
+        stop_event.clear()
+        # 清除进度显示状态
+        self.progress_lines_count = 0
+        # 在GUI中显示恢复状态消息
+        self.pull_log_text.append("🔄 已恢复初始状态")
+        # 恢复初始状态
+        self.reset_ui_state()
+        import logging
+        logging.info("🔄 已恢复初始状态")
+
+    def reset_ui_state(self):
+        """仅重置UI状态，不触发取消操作"""
+        # 递增worker代次，使旧worker的信号被过滤掉
+        self.worker_generation += 1
+
+        # 断开拉取worker信号连接
+        if self.pull_worker is not None:
+            try:
+                self.pull_worker.log_signal.disconnect()
+                self.pull_worker.progress_signal.disconnect()
+                self.pull_worker.finished_signal.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            self.pull_worker = None
+
+        # 清空输入框
         self.image_entry.clear()
         self.tag_entry.setText("latest")
         self.registry_combobox.setCurrentIndex(0)
         self.arch_combobox.setCurrentIndex(0)
-        self.layer_progress_bar.setValue(0)
-        self.overall_progress_bar.setValue(0)
+        self.username_entry.clear()
+        self.password_entry.clear()
 
-        # 搜索区重置
+    def reset_fields(self):
+        """重置表单和搜索状态 - 完全恢复初始状态（强行杀死所有后台线程）"""
+        import logging
+        
+        # 第一步：立即强制终止所有后台线程
+        logging.info("🔄 正在强行终止所有后台线程...")
+        
+        # 收集所有需要终止的线程
+        threads_to_kill = []
+        if self.pull_thread and self.pull_thread.is_alive():
+            threads_to_kill.append(self.pull_thread)
+        if self.search_thread and self.search_thread.is_alive():
+            threads_to_kill.append(self.search_thread)
+        
+        # 强行终止所有活跃的后台线程
+        if threads_to_kill:
+            terminate_threads(threads_to_kill, timeout=0.1)
+            logging.info(f"✅ 已强行终止 {len(threads_to_kill)} 个后台线程")
+        
+        # 清理网络资源和session
+        try:
+            cancel_current_pull()
+        except Exception:
+            pass
+        
+        # 第二步：重置所有状态变量
+        self.is_pulling = False
+        self.is_searching = False
+        
+        # 第三步：递增代次以过滤旧信号
+        self.worker_generation += 1
+        self.search_generation += 1
+        
+        # 第四步：断开所有信号连接
+        if self.pull_worker is not None:
+            try:
+                self.pull_worker.log_signal.disconnect()
+                self.pull_worker.progress_signal.disconnect()
+                self.pull_worker.finished_signal.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            self.pull_worker = None
+        
+        if self.search_worker is not None:
+            try:
+                self.search_worker.log_signal.disconnect()
+                self.search_worker.search_result_signal.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            self.search_worker = None
+        
+        # 第五步：重置UI控件状态
+        self.pull_button.setEnabled(True)
+        self.search_button.setEnabled(True)
+        
+        # 第六步：重置拉取区域
+        self.pull_log_text.clear()
+        self.pull_log_text.append("🔄 已重置 - 后台进程已强行终止")
+        self.image_entry.clear()
+        self.tag_entry.setText("latest")
+        self.registry_combobox.setCurrentIndex(0)
+        self.arch_combobox.setCurrentIndex(0)
+        
+        # 第七步：重置认证区域
+        self.username_entry.clear()
+        self.password_entry.clear()
+        
+        # 第八步：重置搜索区域
         self.search_entry.clear()
         self.search_result_table.setRowCount(0)
         self.search_source_label.setText("")
-        self.is_searching = False
-        self.search_button.setEnabled(True)
-        self.load_registries()  # 重新加载仓库地址
+        self.load_registries()
+        
+        # 第九步：重置进度显示计数
+        self.progress_lines_count = 0
+        
+        # 第十步：清理线程引用
+        self.pull_thread = None
+        self.search_thread = None
+        
+        # 第十一步：重置全局停止事件，允许新的操作
+        try:
+            stop_event.clear()
+        except Exception:
+            pass
+        
+        logging.info("🔄 已强行终止后台进程并恢复初始状态")
 
     def load_registries(self):
         """加载仓库列表"""
         self.registry_combobox.clear()
-        self.registry_combobox.addItem("registry.hub.docker.com")
+        # 默认包含协议，鼓励用户在 registries.txt 中显式写出协议
+        self.registry_combobox.addItem("https://registry.hub.docker.com")
         if os.path.exists("registries.txt"):
             with open("registries.txt", "r", encoding="utf-8") as f:
                 registries = [line.strip() for line in f if line.strip()]
@@ -604,7 +966,7 @@ class DockerPullerGUI(QMainWindow):
             with open("registries.txt", "r", encoding="utf-8") as f:
                 registries_text.setText(f.read().strip())
         else:
-            registries_text.setText("registry.hub.docker.com\n")
+            registries_text.setText("https://registry.hub.docker.com\n")
 
         save_button = QPushButton({
             "zh": "保存",
@@ -629,12 +991,173 @@ class DockerPullerGUI(QMainWindow):
         save_button.clicked.connect(save_registries)
         dialog.exec()
 
-    def show_message(self, title, message):
+    def parse_auth_json(self, text=None):
+        """解析认证 JSON，支持以下结构：
+        - 单对象：{"registry": "host:port", "username": "u", "password": "p"}
+          兼容键名形如"registry1"等前缀。
+        - 列表：[{...}, {...}]，将选择与当前仓库匹配的条目；若无匹配，仅保存不应用。
+        - 映射：{"auths": {"host:port": {"username": "u", "password": "p"}}}
+        返回匹配当前仓库的凭据 dict 或 None（表示不应用，仅保存）。
+        """
+        if text is None:
+            text = ''
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            self.show_message({
+                "zh": "错误",
+                "en": "Error"
+            }[self.language], {
+                "zh": "认证信息 JSON 解析失败，请检查格式。",
+                "en": "Failed to parse auth JSON. Please check the format."
+            }[self.language])
+            return None
+
+        # 规范化比较：忽略协议与尾部斜杠差异
+        def _normalize_registry(reg):
+            if not reg:
+                return ''
+            r = str(reg).strip()
+            if r.startswith('http://'):
+                r = r[len('http://'):]
+            elif r.startswith('https://'):
+                r = r[len('https://'):]
+            return r.rstrip('/')
+
+        def _extract_registry_value(obj: dict):
+            # 首选标准键
+            if 'registry' in obj:
+                return obj.get('registry')
+            # 兼容形如 registry1/registry2 的键名
+            for k in obj.keys():
+                if isinstance(k, str) and k.lower().startswith('registry'):
+                    return obj.get(k)
+            return None
+
+        current_registry = self.registry_combobox.currentText() if hasattr(self, 'registry_combobox') else None
+        current_norm = _normalize_registry(current_registry) if current_registry else None
+
+        # 映射结构：{"auths": {"host:port": {"username": "u", "password": "p"}}}
+        if isinstance(data, dict) and isinstance(data.get('auths'), dict):
+            for reg, val in data.get('auths', {}).items():
+                if current_norm and _normalize_registry(reg) == current_norm and isinstance(val, dict):
+                    user = val.get('username')
+                    pwd = val.get('password')
+                    if user and pwd:
+                        return {"username": user, "password": pwd}
+            # 无匹配：静默返回 None（仅保存，不应用）
+            return None
+
+        # 单对象或普通字典
+        if isinstance(data, dict):
+            reg_val = _extract_registry_value(data)
+            if reg_val and (not current_norm or _normalize_registry(reg_val) == current_norm):
+                return {"username": data.get("username"), "password": data.get("password")}
+            # 无匹配或缺少 registry：静默返回 None（仅保存，不应用）
+            return None
+
+        # 列表结构：选择与当前仓库匹配的条目
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    reg_val = _extract_registry_value(item)
+                    if reg_val and current_norm and _normalize_registry(reg_val) == current_norm:
+                        user = item.get('username')
+                        pwd = item.get('password')
+                        if user and pwd:
+                            return {"username": user, "password": pwd}
+            # 无匹配：静默返回 None（仅保存，不应用）
+            return None
+
+        # 其他结构不支持
+        self.show_message({
+            "zh": "错误",
+            "en": "Error"
+        }[self.language], {
+            "zh": "认证信息 JSON 支持对象、数组或包含 auths 的对象。",
+            "en": "Auth JSON supports an object, an array, or an object with auths."
+        }[self.language])
+        return None
+
+    def apply_auth_env(self, creds):
+        """将认证信息写入环境变量，供拉取逻辑使用"""
+        vars_to_set = [
+            ("DOCKER_REGISTRY_USERNAME", "username"),
+            ("DOCKER_REGISTRY_PASSWORD", "password"),
+            ("REGISTRY_USERNAME", "username"),
+            ("REGISTRY_PASSWORD", "password")
+        ]
+        if creds:
+            for env_key, key in vars_to_set:
+                os.environ[env_key] = creds.get(key, "")
+            # 反馈日志
+            if hasattr(self, 'pull_log_text'):
+                self.pull_log_text.append({
+                    "zh": f"已应用认证信息。用户：{creds.get('username', '')}",
+                    "en": f"Auth applied. User: {creds.get('username', '')}"
+                }[self.language] + "\n")
+        else:
+            for env_key, _ in vars_to_set:
+                if env_key in os.environ:
+                    os.environ.pop(env_key, None)
+
+    def apply_auth_json(self, text=None):
+        """解析并应用认证JSON，同时保存到本地文件。
+        当不匹配当前仓库或为列表/映射无直接匹配时，仍会保存文件，但不应用到环境变量。
+        后端会在拉取时按需读取并匹配使用。
+        """
+        # 先保存到文件
+        saved_ok = False
+        try:
+            text_to_save = text if text is not None else ''
+            with open("auth.json", "w", encoding="utf-8") as f:
+                f.write(text_to_save)
+            saved_ok = True
+        except Exception:
+            saved_ok = False
+
+        # 再尝试解析并应用到环境变量（若匹配当前仓库）
+        creds = self.parse_auth_json(text)
+        if creds:
+            self.apply_auth_env(creds)
+
+        # 成功保存后提示
+        if saved_ok:
+            self.show_message({
+                "zh": "保存成功",
+                "en": "Success"
+            }[self.language], {
+                "zh": "认证信息已保存。",
+                "en": "Auth JSON has been saved."
+            }[self.language], icon=QMessageBox.Icon.Information)
+
+    def apply_auth_json_from_editor(self):
+        """从选项卡编辑器读取并应用"""
+        text = self.auth_json_edit.toPlainText() if hasattr(self, 'auth_json_edit') else ''
+        self.apply_auth_json(text)
+
+    def read_saved_auth_json(self):
+        """读取本地保存的认证JSON文本（如果存在）"""
+        try:
+            if os.path.exists("auth.json"):
+                with open("auth.json", "r", encoding="utf-8") as f:
+                    return f.read()
+        except Exception:
+            return ""
+        return ""
+
+    def show_message(self, title, message, icon=None):
         """显示消息对话框"""
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle(title)
         msg_box.setText(message)
-        msg_box.setIcon(QMessageBox.Icon.Critical)
+        # 默认使用错误图标；若传入自定义图标则替换
+        if icon is None:
+            icon = QMessageBox.Icon.Critical
+        msg_box.setIcon(icon)
 
         # 设置 OK 按钮的样式
         ok_button = msg_box.addButton(QMessageBox.StandardButton.Ok)
@@ -715,7 +1238,7 @@ class DockerPullerGUI(QMainWindow):
             palette.setColor(QPalette.ColorRole.PlaceholderText, Qt.GlobalColor.lightGray)
 
             dark_style = """
-                QTextEdit, QLineEdit {
+                QTextEdit, QLineEdit, QPlainTextEdit {
                     background-color: #252525;
                     color: white;
                     border: 1px solid #444;
@@ -759,16 +1282,6 @@ class DockerPullerGUI(QMainWindow):
                     color: #FFD700;
                     border-bottom: 2px solid #FFD700;
                 }
-                QProgressBar {
-                    border: 1px solid #444;
-                    border-radius: 4px;
-                    background: #252525;
-                    text-align: center;
-                    color: white;
-                }
-                QProgressBar::chunk {
-                    background-color: #45a049;
-                }
                 QTableWidget {
                     background-color: white;
                     color: black;
@@ -776,10 +1289,23 @@ class DockerPullerGUI(QMainWindow):
                     selection-background-color: #e0e0e0;
                     selection-color: black;
                 }
+                /* 暗色模式下右键菜单样式 */
+                QMenu {
+                    background-color: #353535;
+                    color: white;
+                    border: 1px solid #555;
+                }
+                QMenu::item {
+                    padding: 5px 20px;
+                    color: white;
+                }
+                QMenu::item:selected {
+                    background-color: #636363;
+                }
             """
             self.setStyleSheet(dark_style)
             self.search_result_table.setStyleSheet("QTableWidget { background-color: #252525; color: white; border: 1px solid #444; }")
-            self.pull_log_text.setStyleSheet("QTextEdit { background-color: #252525; color: white; border: 1px solid #444; }")
+            self.pull_log_text.setStyleSheet("QTextEdit { background-color: #252525; color: white; border: 1px solid #444; font-family: Consolas, monospace; }")
             self.settings_button.setStyleSheet("""
                 QPushButton {
                     background-color: #535353;
@@ -801,7 +1327,7 @@ class DockerPullerGUI(QMainWindow):
             palette.setColor(QPalette.ColorRole.PlaceholderText, Qt.GlobalColor.gray)
 
             light_style = """
-                QTextEdit, QLineEdit {
+                QTextEdit, QLineEdit, QPlainTextEdit {
                     background-color: white;
                     color: black;
                     border: 1px solid #ccc;
@@ -845,16 +1371,6 @@ class DockerPullerGUI(QMainWindow):
                     color: #0078d7;
                     border-bottom: 2px solid #0078d7;
                 }
-                QProgressBar {
-                    border: 1px solid #ccc;
-                    border-radius: 4px;
-                    background: white;
-                    text-align: center;
-                    color: black;
-                }
-                QProgressBar::chunk {
-                    background-color: #4CAF50;
-                }
                 QTableWidget {
                     background-color: white;
                     color: black;
@@ -870,6 +1386,20 @@ class DockerPullerGUI(QMainWindow):
                 QTableWidget::item:selected:!active {
                     background-color: #e0e0e0;
                     color: black;
+                }
+                /* 亮色模式下右键菜单样式 */
+                QMenu {
+                    background-color: #ffffff;
+                    color: black;
+                    border: 1px solid #ccc;
+                }
+                QMenu::item {
+                    padding: 5px 20px;
+                    color: black;
+                }
+                QMenu::item:selected {
+                    background-color: #0078d7;
+                    color: white;
                 }
             """
             self.setStyleSheet(light_style)
@@ -893,8 +1423,7 @@ class DockerPullerGUI(QMainWindow):
             self.image_label,
             self.tag_label,
             self.arch_label,
-            self.layer_progress_label,
-            self.overall_progress_label,
+            self.auth_label,
             getattr(self, "search_source_label", None)
         ]:
             if label:
@@ -912,9 +1441,10 @@ class DockerPullerGUI(QMainWindow):
         """更新UI文本"""
         translations = {
             "zh": {
-                "window_title": f"Docker 镜像工具 {VERSION}",
+                "window_title": f"Docker 镜像打包工具 {VERSION}",
                 "search_tab": "镜像搜索",
                 "pull_tab": "镜像拉取",
+                "auth_tab": "认证信息",
                 "search_btn": "搜索",
                 "pull_btn": "拉取镜像",
                 "reset_btn": "重置",
@@ -923,13 +1453,15 @@ class DockerPullerGUI(QMainWindow):
                 "image_label": "镜像名称：",
                 "tag_label": "标签版本：",
                 "arch_label": "系统架构：",
-                "layer_progress": "当前层：",
-                "overall_progress": "总体进度："
+                "auth_group": "",
+                "apply_auth": "保存认证",
+                "auth_placeholder": "{\n  \"registry\": \"your.registry.com\",\n  \"username\": \"your_user\",\n  \"password\": \"your_pass\"\n}"
             },
             "en": {
                 "window_title": f"Docker Image Tool {VERSION}",
                 "search_tab": "Image Search",
                 "pull_tab": "Image Pull",
+                "auth_tab": "Auth Info",
                 "search_btn": "Search",
                 "search_group": "Image Search",
                 "pull_btn": "Pull Image",
@@ -939,8 +1471,9 @@ class DockerPullerGUI(QMainWindow):
                 "image_label": "Image Name:",
                 "tag_label": "Tag:",
                 "arch_label": "Architecture:",
-                "layer_progress": "Layer:",
-                "overall_progress": "Overall:"
+                "auth_group": "Auth Info",
+                "apply_auth": "Save Auth",
+                "auth_placeholder": "{\n  \"registry\": \"your.registry.com\",\n  \"username\": \"your_user\",\n  \"password\": \"your_pass\"\n}"
             }
         }
         trans = translations[self.language]
@@ -948,6 +1481,8 @@ class DockerPullerGUI(QMainWindow):
         self.setWindowTitle(trans["window_title"])
         self.tabs.setTabText(0, trans["search_tab"])
         self.tabs.setTabText(1, trans["pull_tab"])
+        if self.tabs.count() > 2:
+            self.tabs.setTabText(2, trans["auth_tab"])
         self.search_button.setText(trans["search_btn"])
         self.pull_button.setText(trans["pull_btn"])
         self.reset_button.setText(trans["reset_btn"])
@@ -956,12 +1491,34 @@ class DockerPullerGUI(QMainWindow):
         self.image_label.setText(trans["image_label"])
         self.tag_label.setText(trans["tag_label"])
         self.arch_label.setText(trans["arch_label"])
-        self.layer_progress_label.setText(trans["layer_progress"])
-        self.overall_progress_label.setText(trans["overall_progress"])
+        # 更新认证信息标签文本
+        if hasattr(self, "auth_label"):
+            self.auth_label.setText({
+                "zh": "认证信息：",
+                "en": "Auth Info:"
+            }[self.language])
+        # 更新认证输入框的placeholder
+        if hasattr(self, "username_entry"):
+            self.username_entry.setPlaceholderText({
+                "zh": "用户名（可选）",
+                "en": "Username (optional)"
+            }[self.language])
+        if hasattr(self, "password_entry"):
+            self.password_entry.setPlaceholderText({
+                "zh": "密码（可选）",
+                "en": "Password (optional)"
+            }[self.language])
         self.search_entry.setPlaceholderText({
             "zh": "输入镜像名称 (如: nginx)",
             "en": "Enter image name (e.g. nginx)"
         }[self.language])
+        # 更新认证选项卡控件文本
+        if hasattr(self, "auth_group"):
+            self.auth_group.setTitle(trans["auth_group"])
+        if hasattr(self, "apply_auth_button"):
+            self.apply_auth_button.setText(trans["apply_auth"])
+        if hasattr(self, "auth_json_edit"):
+            self.auth_json_edit.setPlaceholderText(trans["auth_placeholder"])
 
     def show_settings_dialog(self):
         """显示设置对话框"""
@@ -1043,8 +1600,35 @@ class DockerPullerGUI(QMainWindow):
         apply_btn.clicked.connect(apply_settings)
         dialog.exec()
 
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = DockerPullerGUI()
     window.show()
+    
+    # 确保程序退出时清理所有后台线程
+    def cleanup_on_exit():
+        """程序退出时的清理函数"""
+        import logging
+        logging.info("🧹 程序正在退出，清理后台线程...")
+        
+        # 设置停止事件，通知所有后台线程停止
+        stop_event.set()
+        
+        # 关闭session连接
+        try:
+            from docker_image_puller import SessionManager
+            SessionManager.close_session()
+        except Exception:
+            pass
+        
+        # 等待一小段时间让线程响应
+        import time
+        time.sleep(0.5)
+        
+        logging.info("✅ 清理完成")
+    
+    # 注册退出清理函数
+    app.aboutToQuit.connect(cleanup_on_exit)
+    
     sys.exit(app.exec())
