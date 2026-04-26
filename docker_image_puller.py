@@ -421,6 +421,25 @@ def _normalize_registry(reg: str) -> str:
     return r.rstrip('/')
 
 
+def _get_namespace_from_docker_hub(image_name: str) -> str:
+    """
+    根据镜像名称判断 namespace。
+    
+    规则：
+    - 如果镜像名称包含 '/'，说明已经包含 namespace，直接使用
+    - 如果镜像名称不包含 '/'，使用 'library' 前缀
+    
+    返回正确的 namespace，默认为 'library'。
+    """
+    # 根据镜像名是否包含 '/' 来判断 namespace
+    if '/' in image_name:
+        # 包含 / 说明是 namespace/image 格式
+        return image_name.split('/')[0]
+    else:
+        # 不包含 / 的默认是 library 官方镜像
+        return 'library'
+
+
 def parse_www_authenticate(header_value: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """解析 WWW-Authenticate 头，支持 Bearer 和 Basic。
     返回 (scheme, realm_url, service_name)。可能返回 None。
@@ -572,15 +591,20 @@ def parse_image_input(image_input: str, custom_registry: Optional[str] = None) -
     else:
         parts = image_input.split('/')
         if len(parts) == 1:
-            repo = 'library'
+            # 单名称镜像（如 java, nginx），需要判断 namespace
             img_tag = parts[0]
+            img, *tag_parts = img_tag.split(':')
+            tag = tag_parts[0] if tag_parts else 'latest'
+            
+            # 尝试从 Docker Hub API 获取 namespace，默认为 library
+            namespace = _get_namespace_from_docker_hub(img)
+            repository = f'{namespace}/{img}'
         else:
             repo = '/'.join(parts[:-1])
             img_tag = parts[-1]
-
-        img, *tag_parts = img_tag.split(':')
-        tag = tag_parts[0] if tag_parts else 'latest'
-        repository = f'{repo}/{img}'
+            img, *tag_parts = img_tag.split(':')
+            tag = tag_parts[0] if tag_parts else 'latest'
+            repository = f'{repo}/{img}'
 
         if not registry_host:
             registry = 'registry-1.docker.io'
@@ -636,6 +660,28 @@ def get_auth_head(
                 raise
 
 
+def _get_available_tags_from_docker_hub(repository: str) -> List[str]:
+    """
+    从 Docker Hub API 获取镜像的可用标签列表（用于错误提示）
+    """
+    try:
+        # 解析 namespace 和 image name
+        if '/' in repository:
+            namespace, image = repository.rsplit('/', 1)
+        else:
+            namespace, image = 'library', repository
+        
+        url = f'https://hub.docker.com/v2/repositories/{namespace}/{image}/tags/'
+        resp = requests.get(url, params={'page_size': 10}, timeout=5, verify=False)
+        if resp.status_code == 200:
+            data = resp.json()
+            results = data.get('results', [])
+            return [tag.get('name') for tag in results if tag.get('name')]
+    except Exception:
+        pass
+    return []
+
+
 def fetch_manifest(
     session: requests.Session,
     registry: str,
@@ -655,6 +701,14 @@ def fetch_manifest(
             if resp.status_code == 401:
                 logger.info('需要认证。')
                 return resp, 401
+            if resp.status_code == 404:
+                # Tag 不存在，尝试获取可用标签列表
+                logger.error(f'镜像标签 "{tag}" 不存在')
+                available_tags = _get_available_tags_from_docker_hub(repository)
+                if available_tags:
+                    logger.info(f'💡 可用标签: {", ".join(available_tags[:10])}{"..." if len(available_tags) > 10 else ""}')
+                    logger.info(f'💡 请使用 -i {repository.split("/")[-1]}:<tag> 指定正确的标签')
+                return resp, 404
             resp.raise_for_status()
             return resp, 200
         except requests.exceptions.RequestException as e:
@@ -1682,7 +1736,7 @@ def pull_image_logic(
         logger.info(f'📁 输出目录：{output_dir}')
         logger.info('📥 开始下载...')
 
-        if image_info.registry == 'registry-1.docker.io' and image_info.repository.startswith('library/'):
+        if image_info.registry in ('registry-1.docker.io', 'registry.hub.docker.com', 'docker.io') and image_info.repository.startswith('library/'):
             imgparts = []
         else:
             imgparts = image_info.repository.split('/')[:-1]
@@ -1780,7 +1834,7 @@ def main():
         
         if not auth_success:
             logger.error(f'❌ {error_msg}')
-            logger.info('💡 提示：可以在 auth.json 文件中配置认证信息，或使用环境变量 DOCKER_REGISTRY_USERNAME/PASSWORD')
+            logger.info('💡 提示：请检查网络连接或在 auth.json 文件中配置认证信息，或使用环境变量 DOCKER_REGISTRY_USERNAME/PASSWORD')
             return
         
         # 获取manifest
@@ -1939,7 +1993,7 @@ def main():
         logger.info(f'📁 输出目录：{output_dir}')
         logger.info('📥 开始下载...')
 
-        if image_info.registry == 'registry-1.docker.io' and image_info.repository.startswith('library/'):
+        if image_info.registry in ('registry-1.docker.io', 'registry.hub.docker.com', 'docker.io') and image_info.repository.startswith('library/'):
             imgparts = []
         else:
             imgparts = image_info.repository.split('/')[:-1]
@@ -1955,7 +2009,7 @@ def main():
         output_file = create_image_tar(imgdir, image_info.repository, image_info.tag, args.arch, output_dir)
         logger.info(f'✅ 镜像已保存为: {output_file}')
         logger.info(f'💡 导入命令: docker load -i {output_file}')
-        if image_info.registry not in ("registry-1.docker.io", "docker.io"):
+        if image_info.registry not in ("registry-1.docker.io", "registry.hub.docker.com", "docker.io"):
             logger.info(f'💡 标签命令: docker tag {image_info.repository}:{image_info.tag} {image_info.registry}/{image_info.repository}:{image_info.tag}')
 
     except KeyboardInterrupt:
