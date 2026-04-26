@@ -31,7 +31,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize, QTimer
 
 # 导入核心功能
 from docker_image_puller import pull_image_logic, stop_event, VERSION, cancel_current_pull
-from docker_images_search import DockerImageSearcher
+from docker_images_search import DockerImageSearcher, DEFAULT_IMAGES_LIMIT, DEFAULT_TAGS_LIMIT
 
 class Worker(QObject):
     """用于拉取镜像的后台线程"""
@@ -101,9 +101,6 @@ class Worker(QObject):
             # 普通日志消息
             self.log_signal.emit(self.generation, message)
 
-# 定义默认输出条数
-DEFAULT_RESULT_LIMIT = 25
-
 
 def force_kill_thread(thread):
     """强制终止线程（使用ctypes）"""
@@ -156,18 +153,19 @@ class SearchWorker(QObject):
     log_signal = pyqtSignal(str)
     search_result_signal = pyqtSignal(int, list)
 
-    def __init__(self, search_term, limit=DEFAULT_RESULT_LIMIT, generation=0):
+    def __init__(self, search_term, images_limit=DEFAULT_IMAGES_LIMIT, generation=0):
         super().__init__()
         self.search_term = search_term
-        self.limit = limit
+        self.images_limit = images_limit
         self.generation = generation
-        self.searcher = DockerImageSearcher()
+        # 使用传入的限制初始化搜索器
+        self.searcher = DockerImageSearcher(images_limit=images_limit)
 
     def run(self):
         try:
             self.log_signal.emit(f"正在搜索镜像: {self.search_term}...\n")
             QApplication.processEvents()
-            results = self.searcher.search_images(self.search_term, limit=self.limit) or []
+            results = self.searcher.search_images(self.search_term) or []
             if results:
                 self.log_signal.emit(f"从 {self.searcher.current_registry} 找到 {len(results)} 个结果:\n")
                 self.search_result_signal.emit(self.generation, results)
@@ -179,6 +177,35 @@ class SearchWorker(QObject):
             self.search_result_signal.emit(self.generation, [])
 
 
+class TagsWorker(QObject):
+    """用于获取标签的后台线程"""
+    log_signal = pyqtSignal(str)
+    tags_result_signal = pyqtSignal(int, list, str)  # generation, tags, image_name
+
+    def __init__(self, image_name, tags_limit=DEFAULT_TAGS_LIMIT, generation=0):
+        super().__init__()
+        self.image_name = image_name
+        self.tags_limit = tags_limit
+        self.generation = generation
+        # 使用传入的限制初始化搜索器
+        self.searcher = DockerImageSearcher(tags_limit=tags_limit)
+
+    def run(self):
+        try:
+            self.log_signal.emit(f"正在获取 {self.image_name} 的标签...\n")
+            QApplication.processEvents()
+            tags = self.searcher.get_tags(self.image_name)
+            if tags:
+                self.log_signal.emit(f"找到 {len(tags)} 个标签\n")
+                self.tags_result_signal.emit(self.generation, tags, self.image_name)
+            else:
+                self.log_signal.emit("没有找到标签\n")
+                self.tags_result_signal.emit(self.generation, [], self.image_name)
+        except Exception as e:
+            self.log_signal.emit(f"[ERROR] 获取标签时出错: {e}\n")
+            self.tags_result_signal.emit(self.generation, [], self.image_name)
+
+
 class DockerPullerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -186,8 +213,9 @@ class DockerPullerGUI(QMainWindow):
         self.theme_mode = "light"
         self.is_pulling = False
         self.is_searching = False
-        self.searcher = DockerImageSearcher()
-        self.result_limit = DEFAULT_RESULT_LIMIT
+        # 分别管理镜像和标签搜索结果限制
+        self.images_limit = DEFAULT_IMAGES_LIMIT
+        self.tags_limit = DEFAULT_TAGS_LIMIT
         self.search_generation = 0
         self.worker_generation = 0  # Worker代次，防止旧worker输出干扰
 
@@ -277,6 +305,13 @@ class DockerPullerGUI(QMainWindow):
         search_layout.addWidget(self.search_source_label)
 
         # 搜索结果表格
+        # 保存当前搜索结果，用于返回功能
+        self.last_search_results = []
+        self.current_search_term = ""
+        self.current_image_name_for_tags = ""
+        self.is_showing_tags = False  # 是否正在显示标签结果
+
+        # 搜索结果表格
         self.search_result_table = QTableWidget()
         self.search_result_table.setColumnCount(4)
         self.search_result_table.setHorizontalHeaderLabels(["NAME", "DESCRIPTION", "STARS", "OFFICIAL"])
@@ -287,7 +322,7 @@ class DockerPullerGUI(QMainWindow):
         self.search_result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.search_result_table.verticalHeader().setVisible(False)
         self.search_result_table.setFont(QFont("Consolas", 10))
-        self.search_result_table.doubleClicked.connect(self.fill_pull_fields_from_search)
+        self.search_result_table.doubleClicked.connect(self.on_search_table_double_click)
         search_layout.addWidget(self.search_result_table)
 
         self.tabs.addTab(search_tab, {
@@ -298,7 +333,7 @@ class DockerPullerGUI(QMainWindow):
         # 初始化表头颜色
         self.update_search_table_header_style()
 
-        # 添加右键复制输出信息
+        # 添加右键菜单
         self.search_result_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.search_result_table.customContextMenuRequested.connect(self.show_table_context_menu)
 
@@ -619,7 +654,7 @@ class DockerPullerGUI(QMainWindow):
 
         # 递增搜索代次，用于忽略旧线程的返回结果
         self.search_generation += 1
-        self.search_worker = SearchWorker(search_term, self.result_limit, generation=self.search_generation)
+        self.search_worker = SearchWorker(search_term, self.images_limit, generation=self.search_generation)
         self.search_worker.search_result_signal.connect(self.display_search_results)
         
         # 创建并跟踪搜索线程
@@ -634,6 +669,13 @@ class DockerPullerGUI(QMainWindow):
         self.is_searching = False
         self.search_button.setEnabled(True)
 
+        # 保存搜索结果
+        self.last_search_results = results
+        self.is_showing_tags = False
+        # 恢复原始表头
+        self.search_result_table.setColumnCount(4)
+        self.search_result_table.setHorizontalHeaderLabels(["NAME", "DESCRIPTION", "STARS", "OFFICIAL"])
+
         self.search_result_table.setRowCount(0)
         # 获取来源
         source = getattr(self.search_worker.searcher, "current_registry", "未知来源") if self.search_worker else "未知来源"
@@ -641,8 +683,8 @@ class DockerPullerGUI(QMainWindow):
             source = source.split("://", 1)[1]
         if results:
             msg = {
-                "zh": f"从 {source} 找到 {len(results)} 个结果:",
-                "en": f"Found {len(results)} results from {source}:"
+                "zh": f"从 {source} 找到 {len(results)} 个结果 （双击搜索tag）:",
+                "en": f"Found {len(results)} results from {source} (Double-click to search tag):"
             }[self.language]
             self.search_source_label.setText(msg)
             self.search_result_table.setRowCount(len(results))
@@ -662,8 +704,6 @@ class DockerPullerGUI(QMainWindow):
             self.search_result_table.setItem(0, 1, QTableWidgetItem(""))
             self.search_result_table.setItem(0, 2, QTableWidgetItem(""))
             self.search_result_table.setItem(0, 3, QTableWidgetItem(""))
-            self.search_result_table.setItem(0, 3, QTableWidgetItem(""))
-            self.search_result_table.setItem(0, 4, QTableWidgetItem(""))
 
         # 每次都刷新表头颜色
         self.update_search_table_header_style()
@@ -690,6 +730,184 @@ class DockerPullerGUI(QMainWindow):
                     font-weight: bold;
                 }
             """)
+
+    def on_search_table_double_click(self, index):
+        """处理搜索结果表格的双击事件"""
+        if not index.isValid():
+            return
+
+        row = index.row()
+        if row < 0:
+            return
+
+        if self.is_showing_tags:
+            # 当前显示的是标签列表，双击复制到拉取页的镜像:标签格式
+            tag_item = self.search_result_table.item(row, 0)
+            if tag_item and tag_item.text():
+                tag_name = tag_item.text()
+                # 设置镜像名称和标签到拉取页
+                self.image_entry.setText(self.current_image_name_for_tags)
+                self.tag_entry.setText(tag_name)
+                # 切换到拉取标签页
+                self.tabs.setCurrentIndex(1)
+        else:
+            # 当前显示的是镜像列表，双击获取标签
+            image_item = self.search_result_table.item(row, 0)
+            if image_item and image_item.text():
+                image_name = image_item.text()
+                self.get_tags_for_image(image_name)
+
+    def get_tags_for_image(self, image_name):
+        """获取并显示指定镜像的标签"""
+        if self.is_searching:
+            return
+
+        self.is_searching = True
+        self.search_button.setEnabled(False)
+        self.current_image_name_for_tags = image_name
+
+        self.search_source_label.setText({
+            "zh": f"正在获取 {image_name} 的标签...",
+            "en": f"Getting tags for {image_name}..."
+        }[self.language])
+
+        # 递增搜索代次
+        self.search_generation += 1
+        self.tags_worker = TagsWorker(image_name, self.tags_limit, generation=self.search_generation)
+        self.tags_worker.tags_result_signal.connect(self.display_tags_results)
+        self.tags_worker.log_signal.connect(lambda msg: print(msg.strip()))
+
+        # 创建并跟踪搜索线程
+        self.search_thread = threading.Thread(target=self.tags_worker.run)
+        self.search_thread.start()
+
+    def display_tags_results(self, generation, tags, image_name):
+        """显示标签搜索结果"""
+        # 忽略已被重置的旧搜索线程回传的结果
+        if generation != self.search_generation:
+            return
+        self.is_searching = False
+        self.search_button.setEnabled(True)
+
+        # 设置标志为正在显示标签
+        self.is_showing_tags = True
+
+        # 更改表头为标签格式
+        self.search_result_table.setColumnCount(4)
+        self.search_result_table.setHorizontalHeaderLabels(["TAG", "SIZE", "ARCHITECTURES", "LAST_UPDATED"])
+
+        self.search_result_table.setRowCount(0)
+        if tags:
+            msg = {
+                "zh": f"{image_name} - 找到 {len(tags)} 个标签 (双击填充到拉取页，右键返回)",
+                "en": f"{image_name} - Found {len(tags)} tags (double-click to copy, right-click to go back)"
+            }[self.language]
+            self.search_source_label.setText(msg)
+            self.search_result_table.setRowCount(len(tags))
+            for row, tag in enumerate(tags):
+                self.search_result_table.setItem(row, 0, QTableWidgetItem(tag.get('name', '')))
+                self.search_result_table.setItem(row, 1, QTableWidgetItem(tag.get('size', 'N/A')))
+                self.search_result_table.setItem(row, 2, QTableWidgetItem(tag.get('architectures', '')))
+                last_updated = tag.get('last_updated', '')
+                if last_updated:
+                    last_updated = last_updated.replace("T", " ").replace("Z", "")[:19]
+                self.search_result_table.setItem(row, 3, QTableWidgetItem(last_updated))
+        else:
+            msg = {
+                "zh": f"{image_name} - 没有找到标签",
+                "en": f"{image_name} - No tags found"
+            }[self.language]
+            self.search_source_label.setText(msg)
+            self.search_result_table.setRowCount(0)
+
+        # 更新表头颜色
+        self.update_search_table_header_style()
+
+    def show_table_context_menu(self, pos):
+        """显示表格右键菜单"""
+        index = self.search_result_table.indexAt(pos)
+        if not index.isValid():
+            return
+        menu = QMenu(self)
+
+        if self.is_showing_tags:
+            # 显示标签列表时，右键可以返回镜像列表
+            back_action = menu.addAction({
+                "zh": "返回镜像列表",
+                "en": "Back to Image List"
+            }[self.language])
+            back_action.triggered.connect(self.restore_image_search_results)
+        else:
+            # 显示镜像列表时，可以复制本行
+            copy_action = menu.addAction({
+                "zh": "复制本行",
+                "en": "Copy This Row"
+            }[self.language])
+            copy_action.triggered.connect(lambda: self.copy_table_row(index.row()))
+
+        # 主题自适应
+        if self.theme_mode == "dark":
+            menu.setStyleSheet("""
+                QMenu { 
+                    background-color: #353535; 
+                    color: white; 
+                    border: 1px solid #555;
+                }
+                QMenu::item {
+                    padding: 5px 20px;
+                    color: white;
+                }
+                QMenu::item:selected { 
+                    background-color: #636363; 
+                }
+            """)
+        else:
+            menu.setStyleSheet("""
+                QMenu { 
+                    background-color: #ffffff; 
+                    color: black; 
+                    border: 1px solid #ccc;
+                }
+                QMenu::item {
+                    padding: 5px 20px;
+                    color: black;
+                }
+                QMenu::item:selected { 
+                    background-color: #0078d7; 
+                    color: white;
+                }
+            """)
+
+        menu.exec(self.search_result_table.viewport().mapToGlobal(pos))
+
+    def restore_image_search_results(self):
+        """恢复显示之前的镜像搜索结果"""
+        if not self.last_search_results:
+            return
+
+        self.is_showing_tags = False
+        # 恢复表头
+        self.search_result_table.setColumnCount(4)
+        self.search_result_table.setHorizontalHeaderLabels(["NAME", "DESCRIPTION", "STARS", "OFFICIAL"])
+
+        self.search_result_table.setRowCount(0)
+        results = self.last_search_results
+
+        if results:
+            msg = {
+                "zh": f"找到 {len(results)} 个结果",
+                "en": f"Found {len(results)} results"
+            }[self.language]
+            self.search_source_label.setText(msg)
+            self.search_result_table.setRowCount(len(results))
+            for row, img in enumerate(results):
+                self.search_result_table.setItem(row, 0, QTableWidgetItem(img['name']))
+                self.search_result_table.setItem(row, 1, QTableWidgetItem(img['description']))
+                self.search_result_table.setItem(row, 2, QTableWidgetItem(str(img['stars'])))
+                self.search_result_table.setItem(row, 3, QTableWidgetItem(str(img['official'])))
+
+        # 更新表头颜色
+        self.update_search_table_header_style()
 
     def fill_pull_fields_from_search(self):
         """将搜索结果填充到拉取表单"""
@@ -1558,16 +1776,26 @@ class DockerPullerGUI(QMainWindow):
             ("dark", "en"): "Dark"
         }[(self.theme_mode, self.language)])
 
-        # 输出条数设置
-        limit_label = QLabel({
-            "zh": "输出条数：",
-            "en": "Result Limit:"
+        # 镜像搜索结果数量设置
+        images_limit_label = QLabel({
+            "zh": "镜像搜索数量：",
+            "en": "Image Search Limit:"
         }[self.language])
         from PyQt6.QtWidgets import QSpinBox
-        limit_spin = QSpinBox()
-        limit_spin.setRange(1, 100)
-        limit_spin.setValue(getattr(self, "result_limit", DEFAULT_RESULT_LIMIT))
-        limit_spin.setSingleStep(1)
+        images_limit_spin = QSpinBox()
+        images_limit_spin.setRange(1, 100)
+        images_limit_spin.setValue(self.images_limit)
+        images_limit_spin.setSingleStep(1)
+
+        # 标签搜索结果数量设置
+        tags_limit_label = QLabel({
+            "zh": "标签搜索数量：",
+            "en": "Tag Search Limit:"
+        }[self.language])
+        tags_limit_spin = QSpinBox()
+        tags_limit_spin.setRange(1, 100)
+        tags_limit_spin.setValue(self.tags_limit)
+        tags_limit_spin.setSingleStep(1)
 
         # 应用按钮
         apply_btn = QPushButton({
@@ -1583,8 +1811,10 @@ class DockerPullerGUI(QMainWindow):
         layout.addWidget(lang_combo)
         layout.addWidget(theme_label)
         layout.addWidget(theme_combo)
-        layout.addWidget(limit_label)
-        layout.addWidget(limit_spin)
+        layout.addWidget(images_limit_label)
+        layout.addWidget(images_limit_spin)
+        layout.addWidget(tags_limit_label)
+        layout.addWidget(tags_limit_spin)
         layout.addWidget(apply_btn)
         layout.addStretch()
         dialog.setLayout(layout)
@@ -1592,7 +1822,8 @@ class DockerPullerGUI(QMainWindow):
         def apply_settings():
             self.language = "zh" if lang_combo.currentText() == "中文" else "en"
             self.theme_mode = "light" if theme_combo.currentText() in ["亮色", "Light"] else "dark"
-            self.result_limit = limit_spin.value()
+            self.images_limit = images_limit_spin.value()
+            self.tags_limit = tags_limit_spin.value()
             self.update_ui_text()
             self.apply_theme_mode()
             dialog.close()
