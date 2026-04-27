@@ -55,7 +55,7 @@ python3 docker_image_puller.py -v
 ```
 Enable debug mode and print detailed logs
 ```
-python3 docker_image_puller.py -i alpine -a amd64 -r abc.itelyou.cf --debug
+python3 docker_image_puller.py -i alpine -a amd64 -r https://registry.hub.docker.com --debug
 ```
 As with tar files, log files `docker_pull_log.txt` generated in the current directory
 
