@@ -8,10 +8,13 @@ Currently only supports Chinese and English.
 
 ### Demo  
 **Search mirror**：  
-<img width="1202" height="949" alt="dp_demo1" src="https://github.com/user-attachments/assets/c35b4e7c-bd65-4087-a87c-3506c9f16aed" />
+<img width="1198" height="935" alt="屏幕截图 2026-04-27 140823" src="https://github.com/user-attachments/assets/a38ab048-daa9-43e1-8daa-a10d9514c108" />
+
+**Search tag**：  
+<img width="1196" height="939" alt="屏幕截图 2026-04-27 140841" src="https://github.com/user-attachments/assets/d0c54b6d-8ea8-4df4-8d83-97f7252b4a1b" />
 
 **Download the image package**：  
-<img width="1192" height="937" alt="dp_demo2" src="https://github.com/user-attachments/assets/49a6d081-8839-4656-9580-247a512f7b2d" />
+<img width="1198" height="941" alt="屏幕截图 2026-04-27 140931" src="https://github.com/user-attachments/assets/460d9ade-5fca-4dac-87d7-be45615529c3" />
 
 The purpose of this project is to facilitate the use for users who prefer graphical interfaces.
 
