@@ -5,7 +5,6 @@ import sys
 from typing import List, Dict, Optional
 
 # 全局默认搜索结果限制（与GUI共享）
-DEFAULT_RESULT_LIMIT = 30  # 默认搜索结果数限制
 DEFAULT_IMAGES_LIMIT = 30  # 镜像名称搜索结果数限制
 DEFAULT_TAGS_LIMIT = 50    # 标签搜索结果数限制
 
@@ -15,8 +14,8 @@ class DockerImageSearcher:
     使用Docker Hub的V2 API搜索镜像，输出格式类似docker search命令
     """
     
-    def __init__(self, images_limit: int = None, tags_limit: int = None):
-        self.registries = self._load_registries()
+    def __init__(self, images_limit: int = None, tags_limit: int = None, registry: str = None):
+        self.registries = self._load_registries(registry)
         self.current_registry = None
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -26,27 +25,32 @@ class DockerImageSearcher:
         # 分别管理搜索结果输出限制（与GUI兼容）
         self.max_images_count = images_limit if images_limit is not None else DEFAULT_IMAGES_LIMIT  # 镜像名称搜索结果数限制
         self.max_tags_count = tags_limit if tags_limit is not None else DEFAULT_TAGS_LIMIT      # 标签搜索结果数限制
-    
+        self.custom_registry = registry  # 保存自定义注册表地址
+
     def set_images_limit(self, limit: int):
         """设置镜像名称搜索结果数限制"""
         if limit is not None and limit > 0:
             self.max_images_count = limit
-    
+
     def set_tags_limit(self, limit: int):
         """设置标签搜索结果数限制"""
         if limit is not None and limit > 0:
             self.max_tags_count = limit
-    
+
     def get_images_limit(self) -> int:
         """获取镜像名称搜索结果数限制"""
         return self.max_images_count
-    
+
     def get_tags_limit(self) -> int:
         """获取标签搜索结果数限制"""
         return self.max_tags_count
-    
-    def _load_registries(self) -> List[str]:
+
+    def _load_registries(self, custom_registry: str = None) -> List[str]:
         """加载注册表地址列表，优先使用官方地址"""
+        # 如果用户指定了自定义注册表地址，优先使用
+        if custom_registry:
+            return [custom_registry]
+        
         registries = [
             "https://registry.hub.docker.com",
         ]
@@ -101,45 +105,46 @@ class DockerImageSearcher:
             "Accept": "application/json",
         }
         
-        # 1. 首先尝试 Docker Hub API
-        try:
-            url = f"https://hub.docker.com/v2/repositories/{namespace}/{image}/tags/"
+        # 1. 首先尝试 Docker Hub API（仅当用户未指定自定义注册表时）
+        if not self.custom_registry:
             try:
-                print(f"尝试从 Docker Hub API 获取 tags: {url}", flush=True)
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    params={"page_size": limit},
-                    timeout=10
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    results = data.get("results", [])
+                url = f"https://hub.docker.com/v2/repositories/{namespace}/{image}/tags/"
+                try:
+                    print(f"尝试从 Docker Hub API 获取 tags: {url}", flush=True)
+                    response = requests.get(
+                        url,
+                        headers=headers,
+                        params={"page_size": limit},
+                        timeout=10
+                    )
                     
-                    for tag in results:
-                        tag_info = {
-                            "name": tag.get("name"),
-                            "size": self._format_size(tag.get("full_size", 0)),
-                            "last_updated": tag.get("last_updated", ""),
-                            "digest": tag.get("digest", ""),
-                        }
-                        # 添加架构信息
-                        images = tag.get("images", [])
-                        if images:
-                            archs = [img.get("architecture") for img in images if img.get("architecture")]
-                            tag_info["architectures"] = ", ".join(set(archs))
-                        tags_list.append(tag_info)
-                    
-                    if tags_list:
-                        print(f"✅ 成功获取 {len(tags_list)} 个标签")
-                        return tags_list
+                    if response.status_code == 200:
+                        data = response.json()
+                        results = data.get("results", [])
                         
-            except requests.exceptions.RequestException:
-                pass
+                        for tag in results:
+                            tag_info = {
+                                "name": tag.get("name"),
+                                "size": self._format_size(tag.get("full_size", 0)),
+                                "last_updated": tag.get("last_updated", ""),
+                                "digest": tag.get("digest", ""),
+                            }
+                            # 添加架构信息
+                            images = tag.get("images", [])
+                            if images:
+                                archs = [img.get("architecture") for img in images if img.get("architecture")]
+                                tag_info["architectures"] = ", ".join(set(archs))
+                            tags_list.append(tag_info)
+                        
+                        if tags_list:
+                            print(f"✅ 成功获取 {len(tags_list)} 个标签")
+                            return tags_list
+                            
+                except requests.exceptions.RequestException:
+                    pass
                     
-        except Exception as e:
-            print(f"Docker Hub API 查询失败: {e}", flush=True)
+            except Exception as e:
+                print(f"Docker Hub API 查询失败: {e}", flush=True)
         
         # 2. 尝试 OCI 标准接口 /v2/<name>/tags/list
         try:
@@ -386,9 +391,8 @@ def main():
         add_help=False  # 禁用自动help，我们自己处理
     )
     parser.add_argument("search_term", nargs="?", help="要搜索的镜像名称或关键字")
-    parser.add_argument("--limit", type=int, default=None, help="返回结果数量限制（已废弃，请使用 --images-limit 或 --tags-limit）")
-    parser.add_argument("--images-limit", type=int, default=None, help=f"镜像名称搜索结果数量限制（默认: {DEFAULT_IMAGES_LIMIT}）")
-    parser.add_argument("--tags-limit", type=int, default=None, help=f"标签搜索结果数量限制（默认: {DEFAULT_TAGS_LIMIT}）")
+    parser.add_argument("--registry", dest="registry", default=None, help="指定Docker仓库地址（支持http/https完整地址，如：https://registry.example.com）")
+    parser.add_argument("--limit", type=int, default=None, help=f"搜索结果数量限制（镜像默认: {DEFAULT_IMAGES_LIMIT}, 标签默认: {DEFAULT_TAGS_LIMIT}）")
     parser.add_argument("--tags", action="store_true", help="查询镜像的标签列表")
     parser.add_argument("-h", "--help", action="store_true", help="显示帮助信息")
 
@@ -399,10 +403,11 @@ def main():
             parser.print_help()
             print("\n示例:")
             print("  python docker_images_search.py nginx")
-            print("  python docker_images_search.py mysql --images-limit 10")
             print("  python docker_images_search.py java --tags")
-            print("  python docker_images_search.py openresty/openresty --tags --tags-limit 30")
-            print("  python docker_images_search.py nginx --images-limit 20 --tags-limit 100")
+            print("  python docker_images_search.py mysql --limit 10")
+            print("  python docker_images_search.py openresty/openresty --tags --limit 30")
+            print("  python docker_images_search.py nginx --registry https://registry.example.com")
+            print("  python docker_images_search.py alpine --tags --registry http://localhost:5000")
             return
         
         if not args.search_term:
@@ -410,16 +415,15 @@ def main():
             parser.print_help()
             return
         
-        # 处理兼容性：如果使用了旧的 --limit 参数，根据模式设置相应的限制
-        images_limit = args.images_limit
-        tags_limit = args.tags_limit
-        if args.limit is not None:
-            if args.tags:
-                tags_limit = args.limit
-            else:
-                images_limit = args.limit
+        # 根据搜索模式设置相应的限制
+        if args.tags:
+            images_limit = None
+            tags_limit = args.limit
+        else:
+            images_limit = args.limit
+            tags_limit = None
         
-        searcher = DockerImageSearcher(images_limit=images_limit, tags_limit=tags_limit)
+        searcher = DockerImageSearcher(images_limit=images_limit, tags_limit=tags_limit, registry=args.registry)
         
         # 如果指定了 --tags 参数，查询标签列表
         if args.tags:
