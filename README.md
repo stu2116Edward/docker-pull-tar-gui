@@ -31,7 +31,7 @@ python3 docker_image_puller.py [-i IMAGE] [-a ARCH] [-r REGISTRY]
 ```
 example:
 ```bash
-python3 docker_image_puller.py -i alpine -a amd64 -r abc.itelyou.cf
+python3 docker_image_puller.py -i alpine -a amd64 -r https://registry.hub.docker.com
 ```
 #### Basic usage
 ```
