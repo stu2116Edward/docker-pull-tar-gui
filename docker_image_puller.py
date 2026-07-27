@@ -36,19 +36,12 @@ import signal
 
 urllib3.disable_warnings()
 
-VERSION = "v1.3.0"
+VERSION = "v1.3.1"
 
 MIRROR_SITES = {
     "1": {"name": "Docker Hub (官方)", "registry": "registry-1.docker.io"},
-    "2": {"name": "1ms.run", "registry": "docker.1ms.run"},
-    "3": {"name": "xuanyuan", "registry": "docker.xuanyuan.me"},
-    "4": {"name": "xuanyuan(付费)", "registry": "docker.xuanyuan.cloud"},
-    "5": {"name": "DaoCloud - Docker Hub", "registry": "docker.m.daocloud.io"},
-    "6": {"name": "DaoCloud - K8s", "registry": "k8s.m.daocloud.io"},
-    "7": {"name": "DaoCloud - NVCR", "registry": "nvcr.m.daocloud.io"},
-    "8": {"name": "DaoCloud - GCR", "registry": "gcr.m.daocloud.io"},
-    "9": {"name": "DaoCloud - GHCR", "registry": "ghcr.m.daocloud.io"},
-    "10": {"name": "DaoCloud - Quay", "registry": "quay.m.daocloud.io"},
+    "2": {"name": "柯基lion", "registry": "docker.kejilion.pro"},
+    "3": {"name": "1ms.run", "registry": "docker.1ms.run"},
 }
 
 # 自定义 logging handler，用于将日志发送到 GUI
@@ -534,10 +527,13 @@ def load_auth_credentials(current_registry_host: str) -> Tuple[Optional[str], Op
     return None, None
 
 
-def get_output_dir(repository: str, tag: str, arch: str, output_path: Optional[str] = None) -> Path:
-    """获取输出目录路径，创建以镜像名_tag_arch命名的目录"""
+def get_output_dir(repository: str, tag: str, arch: str, output_path: Optional[str] = None, suffix: Optional[str] = None) -> Path:
+    """获取输出目录路径，创建以镜像名_tag_arch命名的目录（可选 suffix 区分代次）"""
     safe_repo = repository.replace("/", "_").replace(":", "_")
     dir_name = f"{safe_repo}_{tag}_{arch}"
+    if suffix:
+        # 避免非法字符
+        dir_name = f"{dir_name}_{str(suffix)}"
 
     if output_path:
         output_dir = Path(output_path) / dir_name
@@ -1090,8 +1086,9 @@ def download_file_in_chunks(
                         return False
             
             return False
-        
-        max_workers = min(num_chunks, 4)
+
+        # 最大并发线程数：3
+        max_workers = min(num_chunks, 3)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for i, (start, end, chunk_file) in enumerate(chunk_files):
@@ -1284,7 +1281,8 @@ def download_layers(
 
     progress_display.print_initial()
 
-    num_workers = min(len(layers_to_download), 4) if layers_to_download else 1
+    # 至少使用一个线程
+    num_workers = min(len(layers_to_download), 3) if layers_to_download else 1
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = {}
@@ -1544,7 +1542,8 @@ def pull_image_logic(
     username: Optional[str] = None,
     password: Optional[str] = None,
     debug: bool = False,
-    log_callback: Optional[Callable] = None
+    log_callback: Optional[Callable] = None,
+    temp_suffix: Optional[str] = None  # 新增：每次拉取的临时后缀，GUI 可传入 generation 等
 ):
     """核心逻辑函数，供GUI调用"""
     global stop_event
@@ -1716,11 +1715,14 @@ def pull_image_logic(
         
         # 格式化大小显示
         def format_size(size: int) -> str:
-            for unit in ['B', 'KB', 'MB', 'GB']:
-                if size < 1024:
-                    return f"{size:.1f}{unit}"
+            if size == 0:
+                return "0B"
+            units = ['B', 'KB', 'MB', 'GB', 'TB']
+            i = 0
+            while size >= 1024 and i < len(units) - 1:
                 size /= 1024
-            return f"{size:.1f}TB"
+                i += 1
+            return f"{size:.1f}{units[i]}"
         
         size_str = format_size(total_size)
 
@@ -1730,7 +1732,8 @@ def pull_image_logic(
         logger.info(f'📦 架构：{arch}')
         logger.info(f'📦 镜像大小（压缩后的）：{size_str}')
 
-        output_dir = get_output_dir(image_info.repository, image_info.tag, arch)
+        # 使用 temp_suffix 生成每次唯一输出目录，防止不同代次写入相同路径导致文件锁定
+        output_dir = get_output_dir(image_info.repository, image_info.tag, arch, None, suffix=temp_suffix)
         imgdir = str(output_dir / 'layers')
         os.makedirs(imgdir, exist_ok=True)
         logger.info(f'📁 输出目录：{output_dir}')
@@ -1777,16 +1780,16 @@ def main():
             """
         )
         parser.add_argument("-i", "--image", required=False,
-                            help="Docker 镜像名称（例如：nginx:latest 或 harbor.abc.com/abc/nginx:1.26.0）")
+                            help="Docker 镜像名称（例如：nginx:latest 或 registry-1.docker.io/library/nginx:1.26.0）")
         parser.add_argument("-q", "--quiet", action="store_true", help="静默模式，减少交互")
-        parser.add_argument("-r", "--custom-registry", help="自定义仓库地址（例如：harbor.abc.com）")
+        parser.add_argument("-r", "--custom-registry", help="自定义仓库地址（例如：https://docker.kejilion.pro）")
         parser.add_argument("-a", "--arch", default="amd64", help="架构,默认：amd64,常见：amd64, arm64v8等")
         parser.add_argument("-u", "--username", help="Docker 仓库用户名")
         parser.add_argument("-p", "--password", help="Docker 仓库密码")
         parser.add_argument("-o", "--output", help="输出目录，默认为当前目录下的镜像名_tag_arch目录")
         parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}", help="显示版本信息")
         parser.add_argument("--debug", action="store_true", help="启用调试模式，打印请求 URL 和连接状态")
-        parser.add_argument("--workers", type=int, default=4, help="并发下载线程数，默认4")
+        parser.add_argument("--workers", type=int, default=3, help="并发下载线程数，默认3")
 
         logger.info(f'🚀 Docker 镜像拉取工具 {VERSION}')
 
@@ -1796,7 +1799,7 @@ def main():
             logger.setLevel(logging.DEBUG)
 
         if not args.image:
-            args.image = input("请输入 Docker 镜像名称（例如：nginx:latest 或 harbor.abc.com/abc/nginx:1.26.0）：").strip()
+            args.image = input("请输入 Docker 镜像名称（例如：nginx:latest 或 registry-1.docker.io/library/nginx:1.26.0）：").strip()
             if not args.image:
                 logger.error("错误：镜像名称是必填项。")
                 return
@@ -2007,8 +2010,8 @@ def main():
         )
 
         output_file = create_image_tar(imgdir, image_info.repository, image_info.tag, args.arch, output_dir)
-        logger.info(f'✅ 镜像已保存为: {output_file}')
-        logger.info(f'💡 导入命令: docker load -i {output_file}')
+        logger.info(f'✅ 镜像已保存路径: {output_file}')
+        logger.info(f'💡 导入命令: docker load -i {os.path.basename(output_file)}')
         if image_info.registry not in ("registry-1.docker.io", "registry.hub.docker.com", "docker.io"):
             logger.info(f'💡 标签命令: docker tag {image_info.repository}:{image_info.tag} {image_info.registry}/{image_info.repository}:{image_info.tag}')
 
