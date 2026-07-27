@@ -4,6 +4,7 @@ import threading
 import json
 import ctypes
 import time
+import re
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -31,13 +32,13 @@ from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize, QTimer
 
 # 导入核心功能
 from docker_image_puller import pull_image_logic, stop_event, VERSION, cancel_current_pull
-from docker_images_search import DockerImageSearcher, DEFAULT_IMAGES_LIMIT, DEFAULT_TAGS_LIMIT
+from docker_images_search import DockerImageSearcher
 
 class Worker(QObject):
     """用于拉取镜像的后台线程"""
-    log_signal = pyqtSignal(int, str)  # 普通日志信号(代次,消息)
-    progress_signal = pyqtSignal(int, str)  # 进度条专用信号(代次,消息)
-    finished_signal = pyqtSignal(int)  # 完成信号(代次)
+    log_signal = pyqtSignal(int, str)       # 普通日志信号
+    progress_signal = pyqtSignal(int, str)  # 进度条专用信号
+    finished_signal = pyqtSignal(int)       # 完成信号
 
     def __init__(self, image, registry, arch, language, generation=0, username=None, password=None):
         super().__init__()
@@ -103,107 +104,148 @@ class Worker(QObject):
 
 
 def force_kill_thread(thread):
-    """强制终止线程（使用ctypes）"""
+    """强制终止后台工作线程（绝不应用于 UI 主线程）。
+    
+    安全机制：
+    1. 绝不杀死当前线程（UI 主线程）
+    2. 只用于 daemon=True 的后台工作线程
+    3. Windows 下优先使用 kernel32.TerminateThread 直接终止原生线程
+    4. 非 Windows 回退到 PyThreadState_SetAsyncExc 注入 SystemExit
+    
+    注意：在 64 位 Windows 上必须正确设置 OpenThread 的返回类型为 c_void_p，
+    否则 ctypes 会默认按 32 位 c_int 截断 HANDLE 值，导致 TerminateThread 失败。
+    """
+    import logging
     if not thread or not thread.is_alive():
+        return True
+    
+    # 安全检查：绝不杀死当前线程
+    current_tid = threading.current_thread().ident
+    if thread.ident == current_tid:
         return False
     
+    # 安全检查：只杀死守护线程
+    if not thread.daemon:
+        return False
+    
+    tid = thread.ident
+    if tid is None:
+        return False
+    
+    # 方案1: Windows API 直接终止原生线程（最可靠，即使线程在 C 代码中也能立即终止）
+    if sys.platform == 'win32':
+        try:
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            # 必须精确设置返回类型和参数类型以匹配 Windows API，否则 64 位系统上可能失效
+            kernel32.OpenThread.restype = wintypes.HANDLE
+            kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.TerminateThread.restype = wintypes.BOOL
+            kernel32.TerminateThread.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.GetLastError.restype = wintypes.DWORD
+            
+            # THREAD_TERMINATE = 0x0001
+            handle = kernel32.OpenThread(0x0001, wintypes.BOOL(0), wintypes.DWORD(tid))
+            # 兼容某些环境/ctypes版本下 OpenThread 直接返回 int 的情况
+            handle_val = getattr(handle, 'value', handle)
+            if handle_val and handle_val != 0:  # NULL handle check
+                result = kernel32.TerminateThread(handle, wintypes.DWORD(0))
+                kernel32.CloseHandle(handle)
+                if result:
+                    logging.info(f"✅ Windows API 成功终止线程 {tid}")
+                    return True
+                else:
+                    err = kernel32.GetLastError()
+                    logging.warning(f"⚠️ TerminateThread 返回失败，线程 {tid} 可能仍在运行，错误码: {err}")
+            else:
+                err = kernel32.GetLastError()
+                logging.warning(f"⚠️ OpenThread 失败，无法获取线程 {tid} 句柄，错误码: {err}")
+        except Exception as e:
+            logging.warning(f"⚠️ Windows API 终止线程 {tid} 异常: {e}")
+    
+    # 方案2: 注入 SystemExit 异常（线程回到 Python 层面时才会生效）
     try:
-        tid = thread.ident
-        if tid is None:
-            return False
-        
-        # 注入SystemExit异常来终止线程
         res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
             ctypes.c_long(tid),
             ctypes.py_object(SystemExit)
         )
         if res > 1:
-            # 如果返回值大于1，说明出现异常，需要重新设置来清理
             ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(tid), 0)
+            logging.warning(f"⚠️ PyThreadState_SetAsyncExc 注入异常，线程 {tid}")
             return False
-        return res == 1
+        logging.info(f"✅ 已向线程 {tid} 注入 SystemExit")
+        return True
     except Exception as e:
-        import logging
-        logging.error(f"强制终止线程失败: {e}")
+        logging.warning(f"⚠️ PyThreadState_SetAsyncExc 异常，线程 {tid}: {e}")
         return False
 
 
-def terminate_threads(threads, timeout=0.5):
-    """批量终止线程，先尝试join，再强制终止"""
-    if not threads:
-        return
-    
-    # 首先发送停止信号
-    stop_event.set()
-    
-    # 尝试等待线程正常结束
-    for thread in threads:
-        if thread and thread.is_alive():
-            try:
-                thread.join(timeout=timeout)
-            except Exception:
-                pass
-    
-    # 对仍然活动的线程强制终止
-    for thread in threads:
-        if thread and thread.is_alive():
-            force_kill_thread(thread)
-
 class SearchWorker(QObject):
     log_signal = pyqtSignal(str)
-    search_result_signal = pyqtSignal(int, list)
+    search_result_signal = pyqtSignal(int, dict)
 
-    def __init__(self, search_term, images_limit=DEFAULT_IMAGES_LIMIT, generation=0):
+    def __init__(self, search_term, page=1, page_size=100, generation=0):
         super().__init__()
         self.search_term = search_term
-        self.images_limit = images_limit
+        self.page = page
+        self.page_size = page_size
         self.generation = generation
-        # 使用传入的限制初始化搜索器
-        self.searcher = DockerImageSearcher(images_limit=images_limit)
+        # 使用默认限制初始化搜索器（不再限制数量）
+        self.searcher = DockerImageSearcher()
 
     def run(self):
         try:
-            self.log_signal.emit(f"正在搜索镜像: {self.search_term}...\n")
+            self.log_signal.emit(f"正在搜索镜像: {self.search_term} (第{self.page}页)...\n")
             QApplication.processEvents()
-            results = self.searcher.search_images(self.search_term) or []
-            if results:
-                self.log_signal.emit(f"从 {self.searcher.current_registry} 找到 {len(results)} 个结果:\n")
-                self.search_result_signal.emit(self.generation, results)
+            result = self.searcher.search_images(self.search_term, page=self.page, page_size=self.page_size)
+            if result and result.get("results"):
+                self.log_signal.emit(f"从 {self.searcher.current_registry} 找到 {result.get('total', 0)} 个结果:\n")
+                # 添加页码信息到结果中
+                result["page"] = self.page
+                self.search_result_signal.emit(self.generation, result)
             else:
                 self.log_signal.emit("没有找到匹配的镜像\n")
-                self.search_result_signal.emit(self.generation, [])
+                self.search_result_signal.emit(self.generation, {"total": 0, "results": [], "page": self.page})
         except Exception as e:
             self.log_signal.emit(f"[ERROR] 搜索镜像时出错: {e}\n")
-            self.search_result_signal.emit(self.generation, [])
+            self.search_result_signal.emit(self.generation, {"total": 0, "results": [], "page": self.page})
 
 
 class TagsWorker(QObject):
-    """用于获取标签的后台线程"""
+    """用于获取标签的后台线程（支持分页）"""
     log_signal = pyqtSignal(str)
-    tags_result_signal = pyqtSignal(int, list, str)  # generation, tags, image_name
+    tags_result_signal = pyqtSignal(int, dict, str)  # generation, result_dict, image_name
 
-    def __init__(self, image_name, tags_limit=DEFAULT_TAGS_LIMIT, generation=0):
+    def __init__(self, image_name, page=1, page_size=100, tags_limit=None, generation=0, registry=None):
         super().__init__()
         self.image_name = image_name
+        self.page = page
+        self.page_size = page_size
         self.tags_limit = tags_limit
         self.generation = generation
-        # 使用传入的限制初始化搜索器
+        # 使用传入的限制初始化搜索器，不传 registry，让 get_tags 自动遍历所有 registry
         self.searcher = DockerImageSearcher(tags_limit=tags_limit)
 
     def run(self):
         try:
-            self.log_signal.emit(f"正在获取 {self.image_name} 的标签...\n")
+            self.log_signal.emit(f"正在获取 {self.image_name} 第 {self.page} 页标签...\n")
             QApplication.processEvents()
-            tags = self.searcher.get_tags(self.image_name)
-            if tags:
-                self.log_signal.emit(f"找到 {len(tags)} 个标签\n")
-                self.tags_result_signal.emit(self.generation, tags, self.image_name)
+            result = self.searcher.get_tags(self.image_name, page=self.page, page_size=self.page_size)
+            if result:
+                tags = result.get("results", [])
+                total = result.get("total", -1)
+                has_more = result.get("has_more", False)
+                total_str = str(total) if total >= 0 else "未知"
+                self.log_signal.emit(f"找到 {total_str} 个标签，当前页 {len(tags)} 个\n")
+                self.tags_result_signal.emit(self.generation, result, self.image_name)
             else:
                 self.log_signal.emit("没有找到标签\n")
-                self.tags_result_signal.emit(self.generation, [], self.image_name)
+                self.tags_result_signal.emit(self.generation, {"total": 0, "results": [], "has_more": False}, self.image_name)
         except Exception as e:
             self.log_signal.emit(f"[ERROR] 获取标签时出错: {e}\n")
-            self.tags_result_signal.emit(self.generation, [], self.image_name)
+            self.tags_result_signal.emit(self.generation, {"total": 0, "results": [], "has_more": False}, self.image_name)
 
 
 class DockerPullerGUI(QMainWindow):
@@ -213,28 +255,54 @@ class DockerPullerGUI(QMainWindow):
         self.theme_mode = "light"
         self.is_pulling = False
         self.is_searching = False
-        # 分别管理镜像和标签搜索结果限制
-        self.images_limit = DEFAULT_IMAGES_LIMIT
-        self.tags_limit = DEFAULT_TAGS_LIMIT
+        # 分别管理镜像和标签搜索结果限制（None表示无限制）
+        self.images_limit = None
+        self.tags_limit = None
         self.search_generation = 0
         self.worker_generation = 0  # Worker代次，防止旧worker输出干扰
 
         # 跟踪活跃的后台线程
-        self.pull_thread = None  # 拉取线程
-        self.search_thread = None  # 搜索线程
+        self.pull_thread = None     # 拉取线程
+        self.search_thread = None   # 搜索线程
 
         # 分离搜索和拉取的 worker 变量
-        self.pull_worker = None   # 拉取专用
-        self.search_worker = None # 搜索专用
+        self.pull_worker = None     # 拉取专用
+        self.search_worker = None   # 搜索专用
 
         # 定义图标路径
         base_path = os.path.dirname(os.path.abspath(__file__))
         logo_icon_path = os.path.join(base_path, "logo.ico")
         settings_icon_path = os.path.join(base_path, "settings.png")
 
+        # 加载样式片段
+        self.style_snippets = self.load_style_snippets()
+
         self.init_ui(logo_icon_path, settings_icon_path)
         self.apply_theme_mode()
         self.update_ui_text()
+
+    def load_style_snippets(self):
+        """从 style.qss 文件中读取所有样式片段，返回字典 {'name': 'style_string'}"""
+        snippets = {}
+        style_file = os.path.join(os.path.dirname(__file__), "style.qss")
+        try:
+            with open(style_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            # 匹配 /* name */ ... 直到下一个 /* 或结尾
+            pattern = r'/\*\s*([^*]+?)\s*\*/(.*?)(?=/\*|$)'
+            matches = re.findall(pattern, content, re.DOTALL)
+            for name, style in matches:
+                name = name.strip()
+                style = style.strip()
+                snippets[name] = style
+            # 补充一些必须存在的键，防止缺失时报错
+            if 'msg_box_light' not in snippets:
+                snippets['msg_box_light'] = ''  # 亮色模式默认空
+            return snippets
+        except Exception as e:
+            print(f"警告：加载 style.qss 失败 ({e})，使用空样式")
+            # 返回空字典，后续会使用硬编码的后备（但为了提取，我们在此不提供后备，因为样式已提取）
+            return {}
 
     def init_ui(self, logo_icon_path, settings_icon_path):
         self.setWindowTitle(f"Docker 镜像打包工具 {VERSION}")
@@ -310,6 +378,18 @@ class DockerPullerGUI(QMainWindow):
         self.current_search_term = ""
         self.current_image_name_for_tags = ""
         self.is_showing_tags = False  # 是否正在显示标签结果
+        self.current_search_registry = None  # 当前搜索使用的注册表
+
+        # 分页相关变量
+        self.PAGE_SIZE = 100  # 每页显示条数
+        self.current_page = 0  # 当前页码（从0开始）
+        self.total_pages = 0   # 总页数
+        self.total_results = 0  # 总结果数
+        self.page_cache = {}  # 页码 -> 数据列表（1-based）
+        self.loaded_pages = set()  # 已加载的页码集合
+
+        # 保存镜像搜索的分页状态，用于从标签页返回时恢复
+        self._saved_image_page_state = None
 
         # 搜索结果表格
         self.search_result_table = QTableWidget()
@@ -324,6 +404,43 @@ class DockerPullerGUI(QMainWindow):
         self.search_result_table.setFont(QFont("Consolas", 10))
         self.search_result_table.doubleClicked.connect(self.on_search_table_double_click)
         search_layout.addWidget(self.search_result_table)
+
+        # 分页控件
+        self.pagination_widget = QWidget()
+        pagination_layout = QHBoxLayout(self.pagination_widget)
+        pagination_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.prev_page_button = QPushButton({
+            "zh": "上一页",
+            "en": "Previous"
+        }[self.language])
+        self.prev_page_button.clicked.connect(self.go_to_prev_page)
+        self.prev_page_button.setEnabled(False)
+
+        self.page_input = QLineEdit("1")
+        self.page_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.page_input.setFont(QFont("Microsoft YaHei", 10))
+        self.page_input.setFixedWidth(80)
+        self.page_input.setPlaceholderText("页码")
+        self.page_input.returnPressed.connect(self.go_to_page_from_input)
+
+        self.page_total_label = QLabel("/ 1")
+        self.page_total_label.setFont(QFont("Microsoft YaHei", 10))
+
+        self.next_page_button = QPushButton({
+            "zh": "下一页",
+            "en": "Next"
+        }[self.language])
+        self.next_page_button.clicked.connect(self.go_to_next_page)
+        self.next_page_button.setEnabled(False)
+
+        pagination_layout.addStretch()
+        pagination_layout.addWidget(self.prev_page_button)
+        pagination_layout.addWidget(self.page_input)
+        pagination_layout.addWidget(self.page_total_label)
+        pagination_layout.addWidget(self.next_page_button)
+        pagination_layout.addStretch()
+        search_layout.addWidget(self.pagination_widget)
 
         self.tabs.addTab(search_tab, {
             "zh": "镜像搜索",
@@ -341,23 +458,9 @@ class DockerPullerGUI(QMainWindow):
         """根据主题设置表头颜色"""
         header = self.search_result_table.horizontalHeader()
         if self.theme_mode == "dark":
-            header.setStyleSheet("""
-                QHeaderView::section {
-                    background-color: #353535;
-                    color: #FFD700;
-                    border: 1px solid #444;
-                    font-weight: bold;
-                }
-            """)
+            header.setStyleSheet(self.style_snippets.get('header_dark', ''))
         else:
-            header.setStyleSheet("""
-                QHeaderView::section {
-                    background-color: #f0f0f0;
-                    color: #0078d7;
-                    border: 1px solid #ccc;
-                    font-weight: bold;
-                }
-            """)
+            header.setStyleSheet(self.style_snippets.get('header_light', ''))
 
     def show_table_context_menu(self, pos):
         index = self.search_result_table.indexAt(pos)
@@ -370,36 +473,9 @@ class DockerPullerGUI(QMainWindow):
         }[self.language])
         # 主题自适应
         if self.theme_mode == "dark":
-            menu.setStyleSheet("""
-                QMenu { 
-                    background-color: #353535; 
-                    color: white; 
-                    border: 1px solid #555;
-                }
-                QMenu::item {
-                    padding: 5px 20px;
-                    color: white;
-                }
-                QMenu::item:selected { 
-                    background-color: #636363; 
-                }
-            """)
+            menu.setStyleSheet(self.style_snippets.get('menu_dark', ''))
         else:
-            menu.setStyleSheet("""
-                QMenu { 
-                    background-color: #ffffff; 
-                    color: black; 
-                    border: 1px solid #ccc;
-                }
-                QMenu::item {
-                    padding: 5px 20px;
-                    color: black;
-                }
-                QMenu::item:selected { 
-                    background-color: #0078d7; 
-                    color: white;
-                }
-            """)
+            menu.setStyleSheet(self.style_snippets.get('menu_light', ''))
         copy_action.triggered.connect(lambda: self.copy_table_row(index.row()))
         menu.exec(self.search_result_table.viewport().mapToGlobal(pos))
 
@@ -654,45 +730,64 @@ class DockerPullerGUI(QMainWindow):
 
         # 递增搜索代次，用于忽略旧线程的返回结果
         self.search_generation += 1
-        self.search_worker = SearchWorker(search_term, self.images_limit, generation=self.search_generation)
+        self.current_search_term = search_term
+        self.search_worker = SearchWorker(search_term, page=1, page_size=self.PAGE_SIZE, generation=self.search_generation)
         self.search_worker.search_result_signal.connect(self.display_search_results)
         
-        # 创建并跟踪搜索线程
-        self.search_thread = threading.Thread(target=self.search_worker.run)
+        # 创建并跟踪搜索线程（设为守护线程，主程序退出时自动终止）
+        self.search_thread = threading.Thread(target=self.search_worker.run, daemon=True)
         self.search_thread.start()
 
-    def display_search_results(self, generation, results):
-        """显示搜索结果"""
+    def display_search_results(self, generation, result):
+        """显示搜索结果（带分页，支持按需加载）"""
         # 忽略已被重置的旧搜索线程回传的结果
         if generation != self.search_generation:
             return
         self.is_searching = False
         self.search_button.setEnabled(True)
 
-        # 保存搜索结果
-        self.last_search_results = results
-        self.is_showing_tags = False
-        # 恢复原始表头
-        self.search_result_table.setColumnCount(4)
-        self.search_result_table.setHorizontalHeaderLabels(["NAME", "DESCRIPTION", "STARS", "OFFICIAL"])
+        # 解析返回结果
+        total = result.get("total", 0) if result else 0
+        results = result.get("results", []) if result else []
+        page = result.get("page", 1) if result else 1
 
-        self.search_result_table.setRowCount(0)
         # 获取来源
         source = getattr(self.search_worker.searcher, "current_registry", "未知来源") if self.search_worker else "未知来源"
         if "://" in source:
             source = source.split("://", 1)[1]
+
         if results:
+            # 如果是第一页，重置所有数据
+            if page == 1:
+                self.page_cache = {}
+                self.loaded_pages = set()
+                self.total_results = total
+                self.total_pages = min(100, max(1, (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE))
+                self.current_page = 0
+                self.is_showing_tags = False
+                # 保存当前搜索使用的注册表
+                self.current_search_registry = getattr(self.search_worker.searcher, "current_registry", None) if self.search_worker else None
+                # 恢复原始表头
+                self.search_result_table.setColumnCount(4)
+                self.search_result_table.setHorizontalHeaderLabels(["NAME", "DESCRIPTION", "STARS", "OFFICIAL"])
+                # 显示分页控件
+                self.pagination_widget.setVisible(True)
+
+            # 缓存当前页数据（1-based）
+            self.page_cache[page] = results
+            self.loaded_pages.add(page)
+            # 更新 last_search_results 为所有已缓存的数据
+            all_results = []
+            for p in sorted(self.page_cache.keys()):
+                all_results.extend(self.page_cache[p])
+            self.last_search_results = all_results
+
             msg = {
-                "zh": f"从 {source} 找到 {len(results)} 个结果 （双击搜索tag）:",
-                "en": f"Found {len(results)} results from {source} (Double-click to search tag):"
+                "zh": f"从 {source} 找到 {total} 个结果 （双击搜索tag）:",
+                "en": f"Found {total} results from {source} (Double-click to search tag):"
             }[self.language]
             self.search_source_label.setText(msg)
-            self.search_result_table.setRowCount(len(results))
-            for row, img in enumerate(results):
-                self.search_result_table.setItem(row, 0, QTableWidgetItem(img['name']))
-                self.search_result_table.setItem(row, 1, QTableWidgetItem(img['description']))
-                self.search_result_table.setItem(row, 2, QTableWidgetItem(str(img['stars'])))
-                self.search_result_table.setItem(row, 3, QTableWidgetItem(str(img['official'])))
+            self._update_pagination_display()
         else:
             msg = {
                 "zh": "没有找到匹配的镜像",
@@ -704,32 +799,196 @@ class DockerPullerGUI(QMainWindow):
             self.search_result_table.setItem(0, 1, QTableWidgetItem(""))
             self.search_result_table.setItem(0, 2, QTableWidgetItem(""))
             self.search_result_table.setItem(0, 3, QTableWidgetItem(""))
+            self.total_results = 0
+            self.page_cache = {}
+            self.loaded_pages = set()
+            self.total_pages = 0
+            self.current_page = 0
+            self._update_pagination_display()
 
         # 每次都刷新表头颜色
         self.update_search_table_header_style()
 
-        # 设置表头颜色适配主题
+        # 设置表头颜色适配主题（双重保险）
         header = self.search_result_table.horizontalHeader()
         if self.theme_mode == "dark":
-            # 暗色模式表头
-            header.setStyleSheet("""
-                QHeaderView::section {
-                    background-color: #353535;
-                    color: #FFD700;
-                    border: 1px solid #444;
-                    font-weight: bold;
-                }
-            """)
+            header.setStyleSheet(self.style_snippets.get('header_dark', ''))
         else:
-            # 亮色模式表头
-            header.setStyleSheet("""
-                QHeaderView::section {
-                    background-color: #f0f0f0;
-                    color: #0078d7;
-                    border: 1px solid #ccc;
-                    font-weight: bold;
-                }
-            """)
+            header.setStyleSheet(self.style_snippets.get('header_light', ''))
+
+    def _update_pagination_display(self):
+        """更新分页显示"""
+        if not self.page_cache:
+            self.search_result_table.setRowCount(0)
+            self.page_input.setText("1")
+            self.page_total_label.setText("/ 1")
+            self.prev_page_button.setEnabled(False)
+            self.next_page_button.setEnabled(False)
+            return
+
+        # 从缓存获取当前页数据（1-based）
+        current_page_1based = self.current_page + 1
+        page_data = self.page_cache.get(current_page_1based, [])
+
+        self.search_result_table.setRowCount(len(page_data))
+        for row, img in enumerate(page_data):
+            self.search_result_table.setItem(row, 0, QTableWidgetItem(img['name']))
+            self.search_result_table.setItem(row, 1, QTableWidgetItem(img['description']))
+            self.search_result_table.setItem(row, 2, QTableWidgetItem(str(img['stars'])))
+            self.search_result_table.setItem(row, 3, QTableWidgetItem(str(img['official'])))
+
+        self.page_input.setText(str(current_page_1based))
+        self.page_total_label.setText(f"/ {self.total_pages}")
+        self.prev_page_button.setEnabled(self.current_page > 0)
+        self.next_page_button.setEnabled(self.current_page < self.total_pages - 1)
+
+    def go_to_prev_page(self):
+        """上一页"""
+        if self.current_page > 0:
+            self.current_page -= 1
+            if self.is_showing_tags:
+                target_page_1based = self.current_page + 1
+                if target_page_1based in self.tags_loaded_pages:
+                    self._update_tags_pagination_display()
+                else:
+                    self._load_tags_page_data(target_page_1based)
+            else:
+                self._update_pagination_display()
+
+    def go_to_next_page(self):
+        """下一页"""
+        if self.current_page < self.total_pages - 1:
+            target_page = self.current_page + 1
+            target_page_1based = target_page + 1
+            # 先切换页码显示
+            self.current_page = target_page
+            self.page_input.setText(str(target_page_1based))
+            self.prev_page_button.setEnabled(self.current_page > 0)
+            self.next_page_button.setEnabled(self.current_page < self.total_pages - 1)
+            
+            if self.is_showing_tags:
+                # 标签结果按需加载
+                if target_page_1based in self.tags_loaded_pages:
+                    self._update_tags_pagination_display()
+                else:
+                    # 先清空表格显示加载中，再后台加载
+                    self.search_result_table.setRowCount(0)
+                    self.search_source_label.setText({
+                        "zh": f"正在加载第 {target_page_1based} 页标签...",
+                        "en": f"Loading page {target_page_1based} tags..."
+                    }[self.language])
+                    self._load_tags_page_data(target_page_1based)
+            else:
+                # 镜像搜索结果需要按需加载
+                if target_page_1based in self.loaded_pages:
+                    self._update_pagination_display()
+                else:
+                    # 先清空表格显示加载中，再后台加载
+                    self.search_result_table.setRowCount(0)
+                    self.search_source_label.setText({
+                        "zh": f"正在加载第 {target_page_1based} 页数据...",
+                        "en": f"Loading page {target_page_1based}..."
+                    }[self.language])
+                    self._load_page_data(target_page_1based)
+
+    def go_to_page_from_input(self):
+        """从输入框跳转页码"""
+        try:
+            page = int(self.page_input.text().strip())
+            if page < 1:
+                page = 1
+            if page > self.total_pages:
+                page = self.total_pages
+            target_page = page - 1
+            # 先切换页码显示
+            self.current_page = target_page
+            self.page_input.setText(str(page))
+            self.prev_page_button.setEnabled(self.current_page > 0)
+            self.next_page_button.setEnabled(self.current_page < self.total_pages - 1)
+            
+            if self.is_showing_tags:
+                # 标签结果按需加载
+                if page in self.tags_loaded_pages:
+                    self._update_tags_pagination_display()
+                else:
+                    # 先清空表格显示加载中，再后台加载
+                    self.search_result_table.setRowCount(0)
+                    self.search_source_label.setText({
+                        "zh": f"正在加载第 {page} 页标签...",
+                        "en": f"Loading page {page} tags..."
+                    }[self.language])
+                    self._load_tags_page_data(page)
+            else:
+                # 镜像搜索结果需要按需加载
+                if page in self.loaded_pages:
+                    self._update_pagination_display()
+                else:
+                    # 先清空表格显示加载中，再后台加载
+                    self.search_result_table.setRowCount(0)
+                    self.search_source_label.setText({
+                        "zh": f"正在加载第 {page} 页数据...",
+                        "en": f"Loading page {page}..."
+                    }[self.language])
+                    self._load_page_data(page)
+        except ValueError:
+            # 输入无效，恢复当前页码显示
+            self.page_input.setText(str(self.current_page + 1))
+
+    def _load_page_data(self, page):
+        """加载指定页的数据"""
+        if self.is_searching or not self.current_search_term:
+            return
+        
+        self.is_searching = True
+        self.search_button.setEnabled(False)
+        
+        self.search_source_label.setText({
+            "zh": f"正在加载第 {page} 页数据...",
+            "en": f"Loading page {page}..."
+        }[self.language])
+        
+        # 递增搜索代次
+        self.search_generation += 1
+        self.search_worker = SearchWorker(
+            self.current_search_term, 
+            page=page, 
+            page_size=self.PAGE_SIZE, 
+            generation=self.search_generation
+        )
+        self.search_worker.search_result_signal.connect(self.display_search_results)
+        
+        # 创建并跟踪搜索线程（设为守护线程，主程序退出时自动终止）
+        self.search_thread = threading.Thread(target=self.search_worker.run, daemon=True)
+        self.search_thread.start()
+
+    def _load_tags_page_data(self, page):
+        """加载指定页的标签数据"""
+        if self.is_searching or not self.current_image_name_for_tags:
+            return
+        
+        self.is_searching = True
+        self.search_button.setEnabled(False)
+        
+        self.search_source_label.setText({
+            "zh": f"正在加载第 {page} 页标签...",
+            "en": f"Loading page {page} tags..."
+        }[self.language])
+        
+        # 递增搜索代次
+        self.search_generation += 1
+        self.tags_worker = TagsWorker(
+            self.current_image_name_for_tags,
+            page=page,
+            page_size=self.PAGE_SIZE,
+            tags_limit=self.tags_limit,
+            generation=self.search_generation
+        )
+        self.tags_worker.tags_result_signal.connect(self.display_tags_results)
+        self.tags_worker.log_signal.connect(lambda msg: print(msg.strip()))
+        
+        # 创建并跟踪搜索线程（设为守护线程，主程序退出时自动终止）
+        self.search_thread = threading.Thread(target=self.tags_worker.run, daemon=True)
+        self.search_thread.start()
 
     def on_search_table_double_click(self, index):
         """处理搜索结果表格的双击事件"""
@@ -758,7 +1017,7 @@ class DockerPullerGUI(QMainWindow):
                 self.get_tags_for_image(image_name)
 
     def get_tags_for_image(self, image_name):
-        """获取并显示指定镜像的标签"""
+        """获取并显示指定镜像的标签（支持按需分页加载）"""
         if self.is_searching:
             return
 
@@ -766,28 +1025,68 @@ class DockerPullerGUI(QMainWindow):
         self.search_button.setEnabled(False)
         self.current_image_name_for_tags = image_name
 
+        # 保存当前镜像搜索的分页状态，以便返回时恢复
+        if not self.is_showing_tags:
+            self._saved_image_page_state = {
+                "page_cache": dict(self.page_cache),
+                "loaded_pages": set(self.loaded_pages),
+                "total_results": self.total_results,
+                "total_pages": self.total_pages,
+                "current_page": self.current_page,
+                "current_search_registry": self.current_search_registry,
+            }
+
+        # 重置标签分页缓存
+        self.tags_page_cache = {}       # 页码 -> 数据列表（1-based）
+        self.tags_loaded_pages = set()  # 已加载的标签页码集合
+        self.tags_total_results = 0
+        self.tags_has_more = False
+        self.tags_current_search_registry = None
+
         self.search_source_label.setText({
             "zh": f"正在获取 {image_name} 的标签...",
             "en": f"Getting tags for {image_name}..."
         }[self.language])
 
+        # 隐藏分页控件（等数据返回后再显示）
+        self.pagination_widget.setVisible(False)
+
         # 递增搜索代次
         self.search_generation += 1
-        self.tags_worker = TagsWorker(image_name, self.tags_limit, generation=self.search_generation)
+        # 让 TagsWorker 获取第 1 页标签
+        self.tags_worker = TagsWorker(
+            image_name, 
+            page=1,
+            page_size=self.PAGE_SIZE,
+            tags_limit=self.tags_limit, 
+            generation=self.search_generation
+        )
         self.tags_worker.tags_result_signal.connect(self.display_tags_results)
         self.tags_worker.log_signal.connect(lambda msg: print(msg.strip()))
 
-        # 创建并跟踪搜索线程
-        self.search_thread = threading.Thread(target=self.tags_worker.run)
+        # 创建并跟踪搜索线程（设为守护线程，主程序退出时自动终止）
+        self.search_thread = threading.Thread(target=self.tags_worker.run, daemon=True)
         self.search_thread.start()
 
-    def display_tags_results(self, generation, tags, image_name):
-        """显示标签搜索结果"""
+    def display_tags_results(self, generation, result, image_name):
+        """显示标签搜索结果（支持按需分页加载）"""
         # 忽略已被重置的旧搜索线程回传的结果
         if generation != self.search_generation:
             return
         self.is_searching = False
         self.search_button.setEnabled(True)
+
+        # 解析返回结果
+        total = result.get("total", 0) if result else 0
+        tags = result.get("results", []) if result else []
+        has_more = result.get("has_more", False) if result else False
+        page = getattr(self.tags_worker, 'page', 1) if self.tags_worker else 1
+
+        # 获取来源
+        source = getattr(self.tags_worker.searcher, "current_registry", "未知来源") if self.tags_worker else "未知来源"
+        if "://" in source:
+            source = source.split("://", 1)[1]
+        self.tags_current_search_registry = source
 
         # 设置标志为正在显示标签
         self.is_showing_tags = True
@@ -796,22 +1095,32 @@ class DockerPullerGUI(QMainWindow):
         self.search_result_table.setColumnCount(4)
         self.search_result_table.setHorizontalHeaderLabels(["TAG", "SIZE", "ARCHITECTURES", "LAST_UPDATED"])
 
-        self.search_result_table.setRowCount(0)
         if tags:
+            # 缓存当前页数据（1-based）
+            self.tags_page_cache[page] = tags
+            self.tags_loaded_pages.add(page)
+            self.tags_total_results = total if total >= 0 else len(tags)
+            self.tags_has_more = has_more
+            
+            # 计算总页数
+            if total >= 0:
+                self.total_pages = min(100, max(1, (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE))
+            else:
+                # 总数未知时，根据 has_more 推断
+                self.total_pages = page + 1 if has_more else page
+            
+            self.current_page = page - 1  # 内部使用 0-based
+            
+            total_str = str(total) if total >= 0 else "未知"
             msg = {
-                "zh": f"{image_name} - 找到 {len(tags)} 个标签 (双击填充到拉取页，右键返回)",
-                "en": f"{image_name} - Found {len(tags)} tags (double-click to copy, right-click to go back)"
+                "zh": f"{image_name} - 找到 {total_str} 个标签，共 {self.total_pages} 页 (双击填充到拉取页，右键返回)",
+                "en": f"{image_name} - Found {total_str} tags, {self.total_pages} pages (double-click to copy, right-click to go back)"
             }[self.language]
             self.search_source_label.setText(msg)
-            self.search_result_table.setRowCount(len(tags))
-            for row, tag in enumerate(tags):
-                self.search_result_table.setItem(row, 0, QTableWidgetItem(tag.get('name', '')))
-                self.search_result_table.setItem(row, 1, QTableWidgetItem(tag.get('size', 'N/A')))
-                self.search_result_table.setItem(row, 2, QTableWidgetItem(tag.get('architectures', '')))
-                last_updated = tag.get('last_updated', '')
-                if last_updated:
-                    last_updated = last_updated.replace("T", " ").replace("Z", "")[:19]
-                self.search_result_table.setItem(row, 3, QTableWidgetItem(last_updated))
+            
+            # 显示分页控件
+            self.pagination_widget.setVisible(True)
+            self._update_tags_pagination_display()
         else:
             msg = {
                 "zh": f"{image_name} - 没有找到标签",
@@ -819,9 +1128,39 @@ class DockerPullerGUI(QMainWindow):
             }[self.language]
             self.search_source_label.setText(msg)
             self.search_result_table.setRowCount(0)
+            self.pagination_widget.setVisible(False)
+            self.total_pages = 0
+            self.current_page = 0
 
         # 更新表头颜色
         self.update_search_table_header_style()
+
+    def _update_tags_pagination_display(self):
+        """更新标签分页显示（从缓存中获取当前页数据）"""
+        current_page_1based = self.current_page + 1
+        page_data = self.tags_page_cache.get(current_page_1based, [])
+
+        if not page_data:
+            self.search_result_table.setRowCount(0)
+        else:
+            self.search_result_table.setRowCount(len(page_data))
+            for row, tag in enumerate(page_data):
+                self.search_result_table.setItem(row, 0, QTableWidgetItem(tag.get('name', '')))
+                self.search_result_table.setItem(row, 1, QTableWidgetItem(tag.get('size', 'N/A')))
+                self.search_result_table.setItem(row, 2, QTableWidgetItem(tag.get('architectures', '')))
+                last_updated = tag.get('last_updated', '')
+                if last_updated:
+                    last_updated = last_updated.replace("T", " ").replace("Z", "")[:19]
+                self.search_result_table.setItem(row, 3, QTableWidgetItem(last_updated))
+
+        self.page_input.setText(str(current_page_1based))
+        self.page_total_label.setText(f"/ {self.total_pages}")
+        self.prev_page_button.setEnabled(self.current_page > 0)
+        # 当总数未知时，如果有更多页则启用下一页按钮
+        if self.tags_total_results >= 0:
+            self.next_page_button.setEnabled(self.current_page < self.total_pages - 1)
+        else:
+            self.next_page_button.setEnabled(self.tags_has_more or (current_page_1based in self.tags_page_cache and len(self.tags_page_cache[current_page_1based]) == self.PAGE_SIZE))
 
     def show_table_context_menu(self, pos):
         """显示表格右键菜单"""
@@ -847,41 +1186,14 @@ class DockerPullerGUI(QMainWindow):
 
         # 主题自适应
         if self.theme_mode == "dark":
-            menu.setStyleSheet("""
-                QMenu { 
-                    background-color: #353535; 
-                    color: white; 
-                    border: 1px solid #555;
-                }
-                QMenu::item {
-                    padding: 5px 20px;
-                    color: white;
-                }
-                QMenu::item:selected { 
-                    background-color: #636363; 
-                }
-            """)
+            menu.setStyleSheet(self.style_snippets.get('menu_dark', ''))
         else:
-            menu.setStyleSheet("""
-                QMenu { 
-                    background-color: #ffffff; 
-                    color: black; 
-                    border: 1px solid #ccc;
-                }
-                QMenu::item {
-                    padding: 5px 20px;
-                    color: black;
-                }
-                QMenu::item:selected { 
-                    background-color: #0078d7; 
-                    color: white;
-                }
-            """)
+            menu.setStyleSheet(self.style_snippets.get('menu_light', ''))
 
         menu.exec(self.search_result_table.viewport().mapToGlobal(pos))
 
     def restore_image_search_results(self):
-        """恢复显示之前的镜像搜索结果"""
+        """恢复显示之前的镜像搜索结果（带分页）"""
         if not self.last_search_results:
             return
 
@@ -890,21 +1202,33 @@ class DockerPullerGUI(QMainWindow):
         self.search_result_table.setColumnCount(4)
         self.search_result_table.setHorizontalHeaderLabels(["NAME", "DESCRIPTION", "STARS", "OFFICIAL"])
 
-        self.search_result_table.setRowCount(0)
-        results = self.last_search_results
+        # 如果有保存的分页状态，恢复它
+        if self._saved_image_page_state is not None:
+            self.page_cache = self._saved_image_page_state["page_cache"]
+            self.loaded_pages = self._saved_image_page_state["loaded_pages"]
+            self.total_results = self._saved_image_page_state["total_results"]
+            self.total_pages = self._saved_image_page_state["total_pages"]
+            self.current_page = self._saved_image_page_state["current_page"]
+            self.current_search_registry = self._saved_image_page_state.get("current_search_registry")
+            self._saved_image_page_state = None
+        else:
+            # 从 last_search_results 重建 page_cache（假设第一页）
+            self.page_cache = {1: self.last_search_results}
+            self.loaded_pages = {1}
+            self.total_results = len(self.last_search_results)
+            self.total_pages = min(100, max(1, (len(self.last_search_results) + self.PAGE_SIZE - 1) // self.PAGE_SIZE))
+            self.current_page = 0
 
-        if results:
+        # 显示分页控件
+        self.pagination_widget.setVisible(True)
+
+        if self.last_search_results:
             msg = {
-                "zh": f"找到 {len(results)} 个结果",
-                "en": f"Found {len(results)} results"
+                "zh": f"找到 {self.total_results} 个结果",
+                "en": f"Found {self.total_results} results"
             }[self.language]
             self.search_source_label.setText(msg)
-            self.search_result_table.setRowCount(len(results))
-            for row, img in enumerate(results):
-                self.search_result_table.setItem(row, 0, QTableWidgetItem(img['name']))
-                self.search_result_table.setItem(row, 1, QTableWidgetItem(img['description']))
-                self.search_result_table.setItem(row, 2, QTableWidgetItem(str(img['stars'])))
-                self.search_result_table.setItem(row, 3, QTableWidgetItem(str(img['official'])))
+            self._update_pagination_display()
 
         # 更新表头颜色
         self.update_search_table_header_style()
@@ -930,6 +1254,17 @@ class DockerPullerGUI(QMainWindow):
             }[self.language], {
                 "zh": "镜像名称和标签不能为空！",
                 "en": "Image name and tag cannot be empty!"
+            }[self.language])
+            return
+
+        # 如果旧拉取线程仍在运行，拒绝新拉取（避免 stop_event 竞争）
+        if self.pull_thread and self.pull_thread.is_alive():
+            self.show_message({
+                "zh": "提示",
+                "en": "Info"
+            }[self.language], {
+                "zh": "当前拉取操作正在取消中，请稍后再试。",
+                "en": "Current pull operation is being cancelled. Please try again later."
             }[self.language])
             return
 
@@ -964,6 +1299,13 @@ class DockerPullerGUI(QMainWindow):
         self.worker_generation += 1
         current_generation = self.worker_generation
 
+        # 清除 stop_event，允许新拉取（旧线程已确认死亡）
+        from docker_image_puller import stop_event
+        try:
+            stop_event.clear()
+        except Exception:
+            pass
+
         self.pull_worker = Worker(
             f"{image}:{tag}",
             self.registry_combobox.currentText(),
@@ -979,8 +1321,8 @@ class DockerPullerGUI(QMainWindow):
         self.pull_worker.progress_signal.connect(self._handle_progress_signal)
         self.pull_worker.finished_signal.connect(self._handle_finished_signal)
 
-        # 启动线程并跟踪
-        self.pull_thread = threading.Thread(target=self.pull_worker.run)
+        # 启动线程并跟踪（设为守护线程，主程序退出时自动终止）
+        self.pull_thread = threading.Thread(target=self.pull_worker.run, daemon=True)
         self.pull_thread.start()
 
     def _handle_log_signal(self, generation, message):
@@ -1038,7 +1380,10 @@ class DockerPullerGUI(QMainWindow):
         self.pull_button.setEnabled(True)
         # 重置stop_event，允许下一次下载
         from docker_image_puller import stop_event
-        stop_event.clear()
+        try:
+            stop_event.clear()
+        except Exception:
+            pass
         # 清除进度显示状态
         self.progress_lines_count = 0
         # 在GUI中显示恢复状态消息
@@ -1072,39 +1417,58 @@ class DockerPullerGUI(QMainWindow):
         self.password_entry.clear()
 
     def reset_fields(self):
-        """重置表单和搜索状态 - 完全恢复初始状态（强行杀死所有后台线程）"""
+        """重置表单和搜索状态 - 优先优雅终止线程，避免文件锁定"""
         import logging
-        
-        # 第一步：立即强制终止所有后台线程
-        logging.info("🔄 正在强行终止所有后台线程...")
-        
-        # 收集所有需要终止的线程
-        threads_to_kill = []
-        if self.pull_thread and self.pull_thread.is_alive():
-            threads_to_kill.append(self.pull_thread)
-        if self.search_thread and self.search_thread.is_alive():
-            threads_to_kill.append(self.search_thread)
-        
-        # 强行终止所有活跃的后台线程
-        if threads_to_kill:
-            terminate_threads(threads_to_kill, timeout=0.1)
-            logging.info(f"✅ 已强行终止 {len(threads_to_kill)} 个后台线程")
-        
-        # 清理网络资源和session
+        import time
+
+        # 1. 发送停止信号并关闭网络连接（让线程有机会正常退出）
         try:
-            cancel_current_pull()
+            cancel_current_pull()  # 设置 stop_event + 关闭 SessionManager
         except Exception:
             pass
-        
-        # 第二步：重置所有状态变量
+
+        # 关闭搜索器的 session 以中断 HTTP 请求
+        for worker_attr in ['search_worker', 'tags_worker']:
+            worker = getattr(self, worker_attr, None)
+            if worker and hasattr(worker, 'searcher'):
+                try:
+                    worker.searcher.stop()
+                except Exception:
+                    pass
+
+        # 2. 等待后台线程自然退出（优先）
+        threads_to_wait = []
+        if self.pull_thread and self.pull_thread.is_alive():
+            threads_to_wait.append(self.pull_thread)
+        if self.search_thread and self.search_thread.is_alive():
+            threads_to_wait.append(self.search_thread)
+
+        # 最多等待 3 秒，让线程有机会清理文件句柄
+        wait_time = 0
+        while threads_to_wait and wait_time < 3.0:
+            for thread in threads_to_wait[:]:
+                if not thread.is_alive():
+                    threads_to_wait.remove(thread)
+            if threads_to_wait:
+                time.sleep(0.1)
+                wait_time += 0.1
+                QApplication.processEvents()
+
+        # 3. 对于仍未退出的线程，强制终止（最后手段）
+        if self.pull_thread and self.pull_thread.is_alive():
+            force_kill_thread(self.pull_thread)
+        if self.search_thread and self.search_thread.is_alive():
+            force_kill_thread(self.search_thread)
+
+        # 4. 重置所有状态变量
         self.is_pulling = False
         self.is_searching = False
         
-        # 第三步：递增代次以过滤旧信号
+        # 5. 递增代次以过滤旧信号
         self.worker_generation += 1
         self.search_generation += 1
         
-        # 第四步：断开所有信号连接
+        # 6. 断开所有信号连接
         if self.pull_worker is not None:
             try:
                 self.pull_worker.log_signal.disconnect()
@@ -1122,52 +1486,88 @@ class DockerPullerGUI(QMainWindow):
                 pass
             self.search_worker = None
         
-        # 第五步：重置UI控件状态
+        if getattr(self, 'tags_worker', None) is not None:
+            try:
+                self.tags_worker.log_signal.disconnect()
+                self.tags_worker.tags_result_signal.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            self.tags_worker = None
+        
+        # 7. 重置 UI 控件状态
         self.pull_button.setEnabled(True)
         self.search_button.setEnabled(True)
         
-        # 第六步：重置拉取区域
+        # 8. 重置拉取区域
         self.pull_log_text.clear()
-        self.pull_log_text.append("🔄 已重置 - 后台进程已强行终止")
+        self.pull_log_text.append("🔄 已重置 - 后台线程已终止")
         self.image_entry.clear()
         self.tag_entry.setText("latest")
         self.registry_combobox.setCurrentIndex(0)
         self.arch_combobox.setCurrentIndex(0)
         
-        # 第七步：重置认证区域
+        # 9. 重置认证区域
         self.username_entry.clear()
         self.password_entry.clear()
         
-        # 第八步：重置搜索区域
+        # 10. 重置搜索区域
         self.search_entry.clear()
         self.search_result_table.setRowCount(0)
         self.search_source_label.setText("")
         self.load_registries()
         
-        # 第九步：重置进度显示计数
+        # 11. 重置分页相关状态
+        self.page_cache = {}
+        self.loaded_pages = set()
+        self.total_results = 0
+        self.total_pages = 0
+        self.current_page = 0
+        self.is_showing_tags = False
+        self._saved_image_page_state = None
+        self.last_search_results = []
+        self.current_search_term = ""
+        self.current_image_name_for_tags = ""
+        self.current_search_registry = None
+
+        # 12. 重置标签分页缓存
+        self.tags_page_cache = {}
+        self.tags_loaded_pages = set()
+        self.tags_total_results = 0
+        self.tags_has_more = False
+        self.tags_current_search_registry = None
+        self.page_input.setText("1")
+        self.page_total_label.setText("/ 1")
+        self.prev_page_button.setEnabled(False)
+        self.next_page_button.setEnabled(False)
+        self.pagination_widget.setVisible(True)
+        
+        # 13. 重置进度显示计数
         self.progress_lines_count = 0
         
-        # 第十步：清理线程引用
+        # 14. 清理线程引用
         self.pull_thread = None
         self.search_thread = None
         
-        # 第十一步：重置全局停止事件，允许新的操作
+        # 15. 清除 stop_event，允许新的操作
         try:
             stop_event.clear()
         except Exception:
             pass
         
-        logging.info("🔄 已强行终止后台进程并恢复初始状态")
+        logging.info("✅ 已优雅终止后台线程，UI 已恢复初始状态")
 
     def load_registries(self):
-        """加载仓库列表"""
+        """加载仓库列表，优先使用 registries.txt 中的首个地址作为默认"""
         self.registry_combobox.clear()
-        # 默认包含协议，鼓励用户在 registries.txt 中显式写出协议
-        self.registry_combobox.addItem("https://registry.hub.docker.com")
         if os.path.exists("registries.txt"):
             with open("registries.txt", "r", encoding="utf-8") as f:
                 registries = [line.strip() for line in f if line.strip()]
-                self.registry_combobox.addItems(registries)
+                if registries:
+                    # 使用 registries.txt 中的首个地址作为默认
+                    self.registry_combobox.addItems(registries)
+                    return
+        # 兜底：使用官方 Docker Hub
+        self.registry_combobox.addItem("https://registry.hub.docker.com")
 
     def manage_registries(self):
         """管理仓库地址"""
@@ -1384,64 +1784,18 @@ class DockerPullerGUI(QMainWindow):
 
         # 修复暗色模式下弹窗为亮色的问题
         if self.theme_mode == "dark":
-            msg_box.setStyleSheet("""
-                QMessageBox {
-                    background-color: #353535;
-                    color: white;
-                }
-                QLabel {
-                    color: white;
-                }
-                QPushButton {
-                    background-color: #535353;
-                    color: white;
-                    border: 1px solid #333;
-                }
-                QPushButton:hover {
-                    background-color: #636363;
-                }
-            """)
+            msg_box.setStyleSheet(self.style_snippets.get('msg_box_dark', ''))
         else:
-            msg_box.setStyleSheet("")
+            msg_box.setStyleSheet(self.style_snippets.get('msg_box_light', ''))
 
         msg_box.exec()
 
     def apply_button_style(self, button):
         """应用按钮样式"""
         if self.theme_mode == "light":
-            button.setStyleSheet("""
-                QPushButton {
-                    background-color: #4CAF50;
-                    border: none;
-                    color: white;
-                    padding: 8px 16px;
-                    text-align: center;
-                    text-decoration: none;
-                    font-size: 14px;
-                    margin: 4px 2px;
-                    border-radius: 4px;
-                }
-                QPushButton:hover {
-                    background-color: #45a049;
-                }
-            """)
+            button.setStyleSheet(self.style_snippets.get('button_light', ''))
         else:
-            button.setStyleSheet("""
-                QPushButton {
-                    background-color: #535353;
-                    border: 1px solid #333;
-                    color: white;
-                    padding: 8px 16px;
-                    text-align: center;
-                    text-decoration: none;
-                    font-size: 14px;
-                    margin: 4px 2px;
-                    border-radius: 4px;
-                }
-                QPushButton:hover {
-                    background-color: #636363;
-                }
-            """)
+            button.setStyleSheet(self.style_snippets.get('button_dark', ''))
 
     def apply_theme_mode(self):
         """应用主题模式"""
@@ -1455,86 +1809,11 @@ class DockerPullerGUI(QMainWindow):
             palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
             palette.setColor(QPalette.ColorRole.PlaceholderText, Qt.GlobalColor.lightGray)
 
-            dark_style = """
-                QTextEdit, QLineEdit, QPlainTextEdit {
-                    background-color: #252525;
-                    color: white;
-                    border: 1px solid #444;
-                    selection-background-color: #444;
-                    selection-color: white;
-                }
-                QComboBox {
-                    background-color: #252525;
-                    color: white;
-                    border: 1px solid #444;
-                }
-                QComboBox QAbstractItemView {
-                    background-color: #252525;
-                    color: white;
-                    selection-background-color: #444;
-                    selection-color: white;
-                }
-                QGroupBox {
-                    border: 1px solid #444;
-                    margin-top: 6px;
-                    color: white;
-                }
-                QGroupBox:title {
-                    subcontrol-origin: margin;
-                    subcontrol-position: top left;
-                    padding: 0 3px;
-                }
-                QTabWidget::pane {
-                    border: 1px solid #444;
-                    background: #353535;
-                }
-                QTabBar::tab {
-                    background: #353535;
-                    color: white;
-                    border: 1px solid #444;
-                    padding: 6px 12px;
-                    border-bottom: none;
-                }
-                QTabBar::tab:selected {
-                    background: #252525;
-                    color: #FFD700;
-                    border-bottom: 2px solid #FFD700;
-                }
-                QTableWidget {
-                    background-color: white;
-                    color: black;
-                    border: 1px solid #ccc;
-                    selection-background-color: #e0e0e0;
-                    selection-color: black;
-                }
-                /* 暗色模式下右键菜单样式 */
-                QMenu {
-                    background-color: #353535;
-                    color: white;
-                    border: 1px solid #555;
-                }
-                QMenu::item {
-                    padding: 5px 20px;
-                    color: white;
-                }
-                QMenu::item:selected {
-                    background-color: #636363;
-                }
-            """
-            self.setStyleSheet(dark_style)
-            self.search_result_table.setStyleSheet("QTableWidget { background-color: #252525; color: white; border: 1px solid #444; }")
-            self.pull_log_text.setStyleSheet("QTextEdit { background-color: #252525; color: white; border: 1px solid #444; font-family: Consolas, monospace; }")
-            self.settings_button.setStyleSheet("""
-                QPushButton {
-                    background-color: #535353;
-                    border: none;
-                    color: white;
-                }
-                QPushButton:hover {
-                    background-color: #636363;
-                }
-            """)
-            label_color = "color: white;"
+            self.setStyleSheet(self.style_snippets.get('global_dark', ''))
+            self.search_result_table.setStyleSheet(self.style_snippets.get('table_dark', ''))
+            self.pull_log_text.setStyleSheet(self.style_snippets.get('log_dark', ''))
+            self.settings_button.setStyleSheet(self.style_snippets.get('settings_button_dark', ''))
+            label_color = self.style_snippets.get('label_dark', 'color: white;')
         else:
             # 亮色模式设置
             palette.setColor(QPalette.ColorRole.Window, QColor(240, 240, 240))
@@ -1544,96 +1823,11 @@ class DockerPullerGUI(QMainWindow):
             palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.black)
             palette.setColor(QPalette.ColorRole.PlaceholderText, Qt.GlobalColor.gray)
 
-            light_style = """
-                QTextEdit, QLineEdit, QPlainTextEdit {
-                    background-color: white;
-                    color: black;
-                    border: 1px solid #ccc;
-                    selection-background-color: #cceeff;
-                    selection-color: black;
-                }
-                QComboBox {
-                    background-color: white;
-                    color: black;
-                    border: 1px solid #ccc;
-                }
-                QComboBox QAbstractItemView {
-                    background-color: white;
-                    color: black;
-                    selection-background-color: #cceeff;
-                    selection-color: black;
-                }
-                QGroupBox {
-                    border: 1px solid #ccc;
-                    margin-top: 6px;
-                    color: black;
-                }
-                QGroupBox:title {
-                    subcontrol-origin: margin;
-                    subcontrol-position: top left;
-                    padding: 0 3px;
-                }
-                QTabWidget::pane {
-                    border: 1px solid #ccc;
-                    background: #f0f0f0;
-                }
-                QTabBar::tab {
-                    background: #f0f0f0;
-                    color: black;
-                    border: 1px solid #ccc;
-                    padding: 6px 12px;
-                    border-bottom: none;
-                }
-                QTabBar::tab:selected {
-                    background: white;
-                    color: #0078d7;
-                    border-bottom: 2px solid #0078d7;
-                }
-                QTableWidget {
-                    background-color: white;
-                    color: black;
-                    border: 1px solid #ccc;
-                }
-                QTableWidget::item:selected {
-                    background-color: #e0e0e0;
-                    color: black;
-                }
-                QTableWidget::item:focus {
-                    outline: none;
-                }
-                QTableWidget::item:selected:!active {
-                    background-color: #e0e0e0;
-                    color: black;
-                }
-                /* 亮色模式下右键菜单样式 */
-                QMenu {
-                    background-color: #ffffff;
-                    color: black;
-                    border: 1px solid #ccc;
-                }
-                QMenu::item {
-                    padding: 5px 20px;
-                    color: black;
-                }
-                QMenu::item:selected {
-                    background-color: #0078d7;
-                    color: white;
-                }
-            """
-            self.setStyleSheet(light_style)
-            self.search_result_table.setStyleSheet("QTableWidget { background-color: white; color: black; border: 1px solid #ccc; }")
-            self.pull_log_text.setStyleSheet("QTextEdit { background-color: white; color: black; border: 1px solid #ccc; }")
-            self.settings_button.setStyleSheet("""
-                QPushButton {
-                    background-color: #f0f0f0;
-                    border: none;
-                    color: black;
-                }
-                QPushButton:hover {
-                    background-color: #e0e0e0;
-                }
-            """)
-            label_color = "color: black;"
+            self.setStyleSheet(self.style_snippets.get('global_light', ''))
+            self.search_result_table.setStyleSheet(self.style_snippets.get('table_light', ''))
+            self.pull_log_text.setStyleSheet(self.style_snippets.get('log_light', ''))
+            self.settings_button.setStyleSheet(self.style_snippets.get('settings_button_light', ''))
+            label_color = self.style_snippets.get('label_light', 'color: black;')
 
         # 强制设置所有相关label颜色
         for label in [
@@ -1646,6 +1840,19 @@ class DockerPullerGUI(QMainWindow):
         ]:
             if label:
                 label.setStyleSheet(label_color)
+
+        # 设置分页控件颜色
+        if hasattr(self, 'page_input'):
+            if self.theme_mode == "dark":
+                self.page_input.setStyleSheet(self.style_snippets.get('page_input_dark', ''))
+                self.page_total_label.setStyleSheet(self.style_snippets.get('page_total_label_dark', ''))
+                self.prev_page_button.setStyleSheet(self.style_snippets.get('prev_next_button_dark', ''))
+                self.next_page_button.setStyleSheet(self.style_snippets.get('prev_next_button_dark', ''))
+            else:
+                self.page_input.setStyleSheet(self.style_snippets.get('page_input_light', ''))
+                self.page_total_label.setStyleSheet(self.style_snippets.get('page_total_label_light', ''))
+                self.prev_page_button.setStyleSheet(self.style_snippets.get('prev_next_button_light', ''))
+                self.next_page_button.setStyleSheet(self.style_snippets.get('prev_next_button_light', ''))
 
         # 应用调色板到应用程序和窗口
         self.setPalette(palette)
@@ -1689,7 +1896,7 @@ class DockerPullerGUI(QMainWindow):
                 "image_label": "Image Name:",
                 "tag_label": "Tag:",
                 "arch_label": "Architecture:",
-                "auth_group": "Auth Info",
+                "auth_group": "",
                 "apply_auth": "Save Auth",
                 "auth_placeholder": "{\n  \"registry\": \"your.registry.com\",\n  \"username\": \"your_user\",\n  \"password\": \"your_pass\"\n}"
             }
@@ -1776,27 +1983,6 @@ class DockerPullerGUI(QMainWindow):
             ("dark", "en"): "Dark"
         }[(self.theme_mode, self.language)])
 
-        # 镜像搜索结果数量设置
-        images_limit_label = QLabel({
-            "zh": "镜像搜索数量：",
-            "en": "Image Search Limit:"
-        }[self.language])
-        from PyQt6.QtWidgets import QSpinBox
-        images_limit_spin = QSpinBox()
-        images_limit_spin.setRange(1, 100)
-        images_limit_spin.setValue(self.images_limit)
-        images_limit_spin.setSingleStep(1)
-
-        # 标签搜索结果数量设置
-        tags_limit_label = QLabel({
-            "zh": "标签搜索数量：",
-            "en": "Tag Search Limit:"
-        }[self.language])
-        tags_limit_spin = QSpinBox()
-        tags_limit_spin.setRange(1, 100)
-        tags_limit_spin.setValue(self.tags_limit)
-        tags_limit_spin.setSingleStep(1)
-
         # 应用按钮
         apply_btn = QPushButton({
             "zh": "应用",
@@ -1811,10 +1997,6 @@ class DockerPullerGUI(QMainWindow):
         layout.addWidget(lang_combo)
         layout.addWidget(theme_label)
         layout.addWidget(theme_combo)
-        layout.addWidget(images_limit_label)
-        layout.addWidget(images_limit_spin)
-        layout.addWidget(tags_limit_label)
-        layout.addWidget(tags_limit_spin)
         layout.addWidget(apply_btn)
         layout.addStretch()
         dialog.setLayout(layout)
@@ -1822,8 +2004,6 @@ class DockerPullerGUI(QMainWindow):
         def apply_settings():
             self.language = "zh" if lang_combo.currentText() == "中文" else "en"
             self.theme_mode = "light" if theme_combo.currentText() in ["亮色", "Light"] else "dark"
-            self.images_limit = images_limit_spin.value()
-            self.tags_limit = tags_limit_spin.value()
             self.update_ui_text()
             self.apply_theme_mode()
             dialog.close()
@@ -1837,27 +2017,44 @@ if __name__ == "__main__":
     window = DockerPullerGUI()
     window.show()
     
-    # 确保程序退出时清理所有后台线程
+    # 确保程序退出时强制终止所有后台线程
     def cleanup_on_exit():
-        """程序退出时的清理函数"""
+        """程序退出时的清理函数 - 强制终止所有后台线程，确保进程完全退出"""
         import logging
-        logging.info("🧹 程序正在退出，清理后台线程...")
+        logging.info("🧹 程序正在退出，强制终止所有后台线程...")
         
         # 设置停止事件，通知所有后台线程停止
         stop_event.set()
         
-        # 关闭session连接
+        # 关闭拉取 session 连接
         try:
             from docker_image_puller import SessionManager
             SessionManager.close_session()
         except Exception:
             pass
         
-        # 等待一小段时间让线程响应
-        import time
-        time.sleep(0.5)
+        # 关闭搜索器 session 以中断 HTTP 请求
+        for attr in ['search_worker', 'tags_worker']:
+            worker = getattr(window, attr, None)
+            if worker and hasattr(worker, 'searcher'):
+                try:
+                    worker.searcher.stop()
+                except Exception:
+                    pass
         
-        logging.info("✅ 清理完成")
+        # 强制终止所有后台线程（守护线程 + force_kill_thread 双保险）
+        threads_to_kill = []
+        if window.pull_thread and window.pull_thread.is_alive():
+            threads_to_kill.append(window.pull_thread)
+        if window.search_thread and window.search_thread.is_alive():
+            threads_to_kill.append(window.search_thread)
+        
+        killed_count = 0
+        for thread in threads_to_kill:
+            if force_kill_thread(thread):
+                killed_count += 1
+        
+        logging.info(f"✅ 已强制终止后台线程，程序正在退出")
     
     # 注册退出清理函数
     app.aboutToQuit.connect(cleanup_on_exit)
