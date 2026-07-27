@@ -1,9 +1,11 @@
 https://abc.itelyou.cf
+https://docker.kejilion.pro
+https://registry-1.docker.io
 https://docker.1ms.run
 https://docker.etcd.fun
 https://dockerproxy.cool
 https://proxy.vvvv.ee
 https://docker.fxxk.dedyn.io
-https://docker.kejilion.pro
 https://docker.gh-proxy.org
 https://docker.1panel.live
+https://registry.hub.docker.com
